@@ -34,3 +34,4 @@ with open(STATE_FILE, "w") as f:
     f.write(current_hash)
 
 print("Sprawdzono stronę.")
+notify("TEST monitor działa ✅")
