@@ -4,7 +4,7 @@ import os
 import time
 
 URL = "https://test1874.reservio.com/events"
-CHECK_EVERY_SECONDS = 15
+CHECK_EVERY_SECONDS = 300
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
@@ -20,8 +20,18 @@ def get_hash():
     response = requests.get(URL, timeout=20, headers={
         "User-Agent": "Mozilla/5.0"
     })
+
     html = response.text
-    return hashlib.sha256(html.encode("utf-8")).hexdigest()
+
+    important = []
+
+    for line in html.splitlines():
+        if "available" in line.lower() or "slot" in line.lower():
+            important.append(line.strip())
+
+    content = "\n".join(important)
+
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 old_hash = None
 
