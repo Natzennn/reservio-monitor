@@ -4,7 +4,7 @@ import os
 import time
 
 URL = "https://test1874.reservio.com/events"
-CHECK_EVERY_SECONDS = 300
+CHECK_EVERY_SECONDS = 60
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
