@@ -8,8 +8,6 @@ CHECK_EVERY_SECONDS = 60
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
-last_message = None
-
 def notify(text):
     requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -17,39 +15,12 @@ def notify(text):
         timeout=20
     )
 
-def check_available():
-    response = requests.get(
-        URL,
-        timeout=20,
-        headers={"User-Agent": "Mozilla/5.0"}
-    )
+response = requests.get(URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
 
-    html = response.text.lower()
+text = response.text[:3000]
 
-    if "dostępn" in html:
-        return True
-
-    return False
-
-notify("✅ Monitor TTSD uruchomiony.")
+notify("TEST TTSD - bot widzi taki kod strony:\n\n" + text[:3500])
 
 while True:
-    try:
-        available = check_available()
-
-        if available:
-            message = "🚨 TTSD: wykryto dostępne miejsce!\n" + URL
-
-            if message != last_message:
-                notify(message)
-                last_message = message
-
-        else:
-            last_message = None
-
-        print("Sprawdzono TTSD.")
-
-    except Exception as e:
-        print("Błąd:", e)
-
+    print("Test zakończony.")
     time.sleep(CHECK_EVERY_SECONDS)
