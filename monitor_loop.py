@@ -51,7 +51,7 @@ notify("✅ Reservio Playwright monitor uruchomiony.")
 
 while True:
     try:
-        print("Sprawdzam stronę...")
+        print("Sprawdzam stronę...", flush=True)
 
         text = get_page_text()
 
@@ -62,7 +62,7 @@ while True:
 
         current_state = len(available_matches) > 0
 
-        print("Dostępne:", current_state)
+        print("Dostępne:", current_state, flush=True)
 
         if current_state != last_state:
 
@@ -72,17 +72,11 @@ while True:
                     + URL
                 )
 
-            else:
-                notify(
-                    "❌ Reservio: brak dostępnych miejsc.\n"
-                    + URL
-                )
-
             last_state = current_state
 
-        print("Sprawdzono Reservio.")
+        print("Sprawdzono Reservio.", flush=True)
 
     except Exception as e:
-        print("Błąd:", e)
+        print("Błąd:", e, flush=True)
 
     time.sleep(CHECK_EVERY_SECONDS)
