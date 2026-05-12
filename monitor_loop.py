@@ -30,16 +30,23 @@ def get_hash():
 
     html = response.text
 
-    # normalizacja tekstu
-    text = " ".join(html.split())
+    important = []
+
+    for line in html.splitlines():
+        line_lower = line.lower()
+
+        if "dostępn" in line_lower:
+            important.append(line.strip())
+
+    content = "\n".join(important)
 
     return hashlib.sha256(
-        text.encode("utf-8")
+        content.encode("utf-8")
     ).hexdigest()
 
 old_hash = None
 
-notify("✅ Monitor Reservio uruchomiony na serwerze.")
+notify("✅ Monitor Reservio uruchomiony.")
 
 while True:
     try:
@@ -47,7 +54,7 @@ while True:
 
         if old_hash and old_hash != current_hash:
             notify(
-                "🚨 Wykryto zmianę na Reservio!\n"
+                "🚨 Wykryto wolne miejsce na Reservio!\n"
                 + URL
             )
 
