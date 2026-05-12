@@ -1,8 +1,8 @@
 {
   "build": {
-    "buildCommand": "pip install -r requirements.txt && python -m playwright install chromium"
+    "buildCommand": "pip install -r requirements.txt"
   },
   "deploy": {
-    "startCommand": "python monitor_loop.py"
+    "startCommand": "python -m playwright install chromium && python monitor_loop.py"
   }
 }
