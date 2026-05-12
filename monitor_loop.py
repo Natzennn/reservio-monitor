@@ -1,11 +1,15 @@
+from playwright.sync_api import sync_playwright
 import requests
 import os
 import time
 
 URL = "https://ttsd.reservio.com/events"
+CHECK_EVERY_SECONDS = 60
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
+
+last_state = None
 
 def notify(text):
     requests.post(
@@ -17,21 +21,49 @@ def notify(text):
         timeout=20
     )
 
-response = requests.get(
-    URL,
-    headers={
-        "User-Agent": "Mozilla/5.0"
-    },
-    timeout=20
-)
+def get_page_text():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
 
-text = response.text[:3500]
+        page = browser.new_page()
 
-notify(
-    "TTSD TEST:\n\n"
-    + text
-)
+        page.goto(
+            URL,
+            wait_until="networkidle",
+            timeout=60000
+        )
+
+        text = page.inner_text("body")
+
+        browser.close()
+
+        return text.lower()
+
+notify("✅ TTSD Playwright monitor uruchomiony.")
 
 while True:
-    print("Test działa.")
-    time.sleep(60)
+    try:
+        text = get_page_text()
+
+        current_state = "dostępn" in text
+
+        if current_state != last_state:
+            if current_state:
+                notify(
+                    "🚨 TTSD: wykryto dostępne miejsce!\n"
+                    + URL
+                )
+            else:
+                notify(
+                    "❌ TTSD: brak dostępnych miejsc.\n"
+                    + URL
+                )
+
+            last_state = current_state
+
+        print("Sprawdzono TTSD.")
+
+    except Exception as e:
+        print("Błąd:", e)
+
+    time.sleep(CHECK_EVERY_SECONDS)
