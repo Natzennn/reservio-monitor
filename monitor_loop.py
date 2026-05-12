@@ -12,26 +12,30 @@ CHAT_ID = os.environ["CHAT_ID"]
 def notify(text):
     requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": text},
+        data={
+            "chat_id": CHAT_ID,
+            "text": text
+        },
         timeout=20
     )
 
 def get_hash():
-    response = requests.get(URL, timeout=20, headers={
-        "User-Agent": "Mozilla/5.0"
-    })
+    response = requests.get(
+        URL,
+        timeout=20,
+        headers={
+            "User-Agent": "Mozilla/5.0"
+        }
+    )
 
     html = response.text
 
-    important = []
+    # normalizacja tekstu
+    text = " ".join(html.split())
 
-    for line in html.splitlines():
-        if "available" in line.lower() or "slot" in line.lower():
-            important.append(line.strip())
-
-    content = "\n".join(important)
-
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        text.encode("utf-8")
+    ).hexdigest()
 
 old_hash = None
 
@@ -42,9 +46,13 @@ while True:
         current_hash = get_hash()
 
         if old_hash and old_hash != current_hash:
-            notify("🚨 Zmiana na Reservio! Sprawdź terminy: " + URL)
+            notify(
+                "🚨 Wykryto zmianę na Reservio!\n"
+                + URL
+            )
 
         old_hash = current_hash
+
         print("Sprawdzono stronę.")
 
     except Exception as e:
