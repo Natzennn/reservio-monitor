@@ -45,7 +45,7 @@ while True:
     try:
         text = get_page_text()
 
-        current_state = "dostępn" in text
+        current_state = "brak dostępnych miejsc" not in text
 
         if current_state != last_state:
             if current_state:
