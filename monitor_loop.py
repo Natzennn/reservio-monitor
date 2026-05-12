@@ -3,7 +3,7 @@ import requests
 import os
 import time
 
-URL = "https://ttsd.reservio.com/events"
+URL = "https://test1874.reservio.com/events"
 CHECK_EVERY_SECONDS = 60
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -39,7 +39,7 @@ def get_page_text():
 
         return text.lower()
 
-notify("✅ TTSD Playwright monitor uruchomiony.")
+notify("✅ Reservio Playwright monitor uruchomiony.")
 
 while True:
     try:
@@ -50,18 +50,18 @@ while True:
         if current_state != last_state:
             if current_state:
                 notify(
-                    "🚨 TTSD: wykryto dostępne miejsce!\n"
+                    "🚨 Reservio: wykryto dostępne miejsce!\n"
                     + URL
                 )
             else:
                 notify(
-                    "❌ TTSD: brak dostępnych miejsc.\n"
+                    "❌ Reservio: brak dostępnych miejsc.\n"
                     + URL
                 )
 
             last_state = current_state
 
-        print("Sprawdzono TTSD.")
+        print("Sprawdzono Reservio.")
 
     except Exception as e:
         print("Błąd:", e)
