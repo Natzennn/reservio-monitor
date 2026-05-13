@@ -26,6 +26,7 @@ def notify(text):
 
 def get_page_text():
     with sync_playwright() as p:
+
         browser = p.chromium.launch(
             headless=True,
             args=["--no-sandbox"]
@@ -35,9 +36,11 @@ def get_page_text():
 
         page.goto(
             URL,
-            wait_until="networkidle",
+            wait_until="domcontentloaded",
             timeout=60000
         )
+
+        page.wait_for_timeout(5000)
 
         text = page.inner_text("body")
 
