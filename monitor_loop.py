@@ -25,28 +25,44 @@ def notify(text):
 
 
 def get_page_text():
-    with sync_playwright() as p:
 
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox"]
-        )
+    for attempt in range(3):
 
-        page = browser.new_page()
+        try:
+            with sync_playwright() as p:
 
-        page.goto(
-            URL,
-            wait_until="domcontentloaded",
-            timeout=60000
-        )
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox"]
+                )
 
-        page.wait_for_timeout(5000)
+                page = browser.new_page()
 
-        text = page.inner_text("body")
+                page.goto(
+                    URL,
+                    wait_until="commit",
+                    timeout=60000
+                )
 
-        browser.close()
+                page.wait_for_timeout(8000)
 
-        return text.lower()
+                text = page.inner_text("body")
+
+                browser.close()
+
+                return text.lower()
+
+        except Exception as e:
+            print(
+                f"Próba {attempt + 1} nieudana: {e}",
+                flush=True
+            )
+
+            time.sleep(5)
+
+    raise Exception(
+        "Nie udało się załadować strony po 3 próbach"
+    )
 
 
 notify("✅ Reservio Playwright monitor uruchomiony.")
