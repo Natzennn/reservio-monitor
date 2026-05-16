@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 
 URL = "https://test1874.reservio.com/events"
-CHECK_EVERY_SECONDS = 60
+CHECK_EVERY_SECONDS = 180
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
