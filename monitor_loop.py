@@ -3,6 +3,7 @@ import requests
 import os
 import time
 import re
+from datetime import datetime
 
 URL = "https://test1874.reservio.com/events"
 CHECK_EVERY_SECONDS = 60
@@ -14,88 +15,98 @@ last_state = None
 
 
 def notify(text):
-    requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-        data={
-            "chat_id": CHAT_ID,
-            "text": text
-        },
-        timeout=20
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={
+                "chat_id": CHAT_ID,
+                "text": text
+            },
+            timeout=20
+        )
+    except Exception as e:
+        print("Błąd Telegram:", e, flush=True)
+
+
+def has_available_place(text):
+    matches = re.findall(
+        r"\d+\s+(miejsce dostępne|miejsca dostępne|miejsc dostępnych)",
+        text.lower()
     )
 
-
-def get_page_text():
-
-    for attempt in range(3):
-
-        try:
-            with sync_playwright() as p:
-
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox"]
-                )
-
-                page = browser.new_page()
-
-                page.goto(
-                    URL,
-                    wait_until="commit",
-                    timeout=60000
-                )
-
-                page.wait_for_timeout(8000)
-
-                text = page.inner_text("body")
-
-                browser.close()
-
-                return text.lower()
-
-        except Exception as e:
-            print(
-                f"Próba {attempt + 1} nieudana: {e}",
-                flush=True
-            )
-
-            time.sleep(5)
-
-    raise Exception(
-        "Nie udało się załadować strony po 3 próbach"
-    )
+    return len(matches) > 0
 
 
-notify("✅ Reservio Playwright monitor uruchomiony.")
+def get_page_text(page):
+    try:
+        page.goto(
+            URL,
+            wait_until="domcontentloaded",
+            timeout=30000
+        )
+    except Exception as e:
+        print("Goto warning:", e, flush=True)
 
+    try:
+        page.wait_for_timeout(10000)
+        return page.inner_text("body").lower()
+    except Exception as e:
+        print("Błąd odczytu tekstu:", e, flush=True)
+        return ""
+
+
+notify("✅ Reservio monitor uruchomiony na Railway.")
 
 while True:
     try:
-        print("Sprawdzam stronę...", flush=True)
+        print("Start pętli Playwright...", flush=True)
 
-        text = get_page_text()
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu"
+                ]
+            )
 
-        available_matches = re.findall(
-            r"\d+\s+(miejsce dostępne|miejsca dostępne|miejsc dostępnych)",
-            text
-        )
+            page = browser.new_page()
 
-        current_state = len(available_matches) > 0
+            while True:
+                try:
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"[{now}] Sprawdzam stronę...", flush=True)
 
-        print("Dostępne:", current_state, flush=True)
+                    text = get_page_text(page)
 
-        if current_state != last_state:
+                    current_state = has_available_place(text)
 
-            if current_state:
-                notify(
-                    "🚨 Reservio: wykryto dostępne miejsce!\n"
-                    + URL
-                )
+                    print("Dostępne:", current_state, flush=True)
 
-            last_state = current_state
+                    if current_state != last_state:
+                        if current_state:
+                            notify(
+                                "🚨 Reservio: wykryto dostępne miejsce!\n"
+                                + URL
+                            )
 
-        print("Sprawdzono Reservio.", flush=True)
+                        last_state = current_state
+
+                    print("Sprawdzono Reservio.", flush=True)
+
+                except Exception as e:
+                    print("Błąd w sprawdzaniu:", e, flush=True)
+
+                    try:
+                        page.close()
+                    except:
+                        pass
+
+                    page = browser.new_page()
+
+                time.sleep(CHECK_EVERY_SECONDS)
 
     except Exception as e:
-        print("Błąd:", e, flush=True)
-
-    time.sleep(CHECK_EVERY_SECONDS)
+        print("Duży błąd Playwright, restart za 30 sekund:", e, flush=True)
+        time.sleep(30)
