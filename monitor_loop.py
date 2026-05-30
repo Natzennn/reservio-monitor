@@ -3,7 +3,6 @@ import requests
 import os
 import time
 import re
-import json
 from datetime import datetime
 
 # Konfiguracja bota
@@ -30,7 +29,7 @@ def notify(text):
 
 
 def has_available_place(text):
-    """Sprawdza za pomocą Regex w całym tekście, czy są wolne miejsca."""
+    """Sprawdza za pomocą Regex, czy w wyrenderowanym tekście są wolne miejsca."""
     matches = re.findall(
         r"\d+\s+(miejsce dostępne|miejsca dostępne|miejsc dostępnych)",
         text.lower()
@@ -38,10 +37,10 @@ def has_available_place(text):
     return len(matches) > 0
 
 
-def check_reservio_entire_calendar():
-    """Otwiera stronę, wyciąga z niej cały ukryty kod JSON oraz pełny tekst,
+def check_reservio_by_clicking():
+    """Otwiera stronę i klika strzałkę w prawo kilka razy, żeby wyrenderować
 
-    co pozwala monitorować wydarzenia w przód, a nie tylko obecny tydzień.
+    nadchodzące tygodnie, po czym zbiera z nich skumulowany tekst.
     """
     for attempt in range(3):
         try:
@@ -56,30 +55,29 @@ def check_reservio_entire_calendar():
                 )
                 page = browser.new_page()
                 
-                # Wchodzimy na stronę i czekamy na stabilne załadowanie
+                # Wejście na stronę
                 page.goto(URL, wait_until="commit", timeout=60000)
+                page.wait_for_timeout(6000)
                 
-                # Kluczowe sekundy na dociągnięcie całego kalendarza przez JS
-                page.wait_for_timeout(10000)
+                # Zbieramy tekst z 1. tygodnia (obecnego)
+                accumulated_text = page.inner_text("body").lower()
                 
-                # 1. POBIERANIE UKRYTEGO JSONA (Widzi miesiące w przód)
-                # Szukamy tagu, który pokazałeś na zrzucie ekranu
-                full_json_text = ""
-                try:
-                    next_data_script = page.locator("script#__NEXT_DATA__")
-                    if next_data_script.count() > 0:
-                        full_json_text = next_data_script.inner_text().lower()
-                except Exception as json_err:
-                    print(f"Brak skryptu JSON (nic nie szkodzi): {json_err}", flush=True)
-
-                # 2. POBIERANIE WIDOCZNEGO TEKSTU (Dla obecnego tygodnia)
-                visible_text = page.inner_text("body").lower()
-                
-                # Łączymy oba źródła danych w jeden wielki worek informacji
-                combined_data = visible_text + " " + full_json_text
+                # Klikamy strzałkę "Dalej" (w prawo) 5 razy, żeby sprawdzić kolejnych 5 tygodni w przód!
+                # Selektory pasują do przycisków nawigacji kalendarza (szukamy ikony lub strzałki)
+                for i in range(5):
+                    try:
+                        # Próbuje kliknąć przycisk nawigacji (strzałkę w prawo)
+                        next_button = page.locator('button:has(svg), [aria-label*="next"], .next-button, .bi-chevron-right').first
+                        if next_button.count() > 0:
+                            next_button.click()
+                            page.wait_for_timeout(2000)  # Czekamy 2 sekundy na załadowanie nowego tygodnia
+                            # Doklejamy tekst z kolejnego tygodnia do naszego "worka"
+                            accumulated_text += " " + page.inner_text("body").lower()
+                    except Exception as click_err:
+                        print(f"Nie udało się kliknąć strzałki na kroku {i}: {click_err}", flush=True)
                 
                 browser.close()
-                return combined_data
+                return accumulated_text
                 
         except Exception as e:
             print(f"Próba {attempt + 1} nieudana: {e}", flush=True)
@@ -88,25 +86,25 @@ def check_reservio_entire_calendar():
     raise Exception("Nie udało się pobrać danych ze strony po 3 próbach.")
 
 
-notify("✅ Zaawansowany monitor CAŁEGO kalendarza (Wersja JSON+Tekst) wystartował.")
+notify("✅ Poprawiony monitor klikający (Sprawdzanie tygodni w przód) wystartował.")
 
 while True:
     try:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{now}] Przeszukuję cały kalendarz (obecny tydzień + ukryte dane)...", flush=True)
+        print(f"[{now}] Przeklikuję kalendarz na 5 tygodni w przód...", flush=True)
 
-        # Pobieramy połączone dane z całego kodu strony
-        big_text_data = check_reservio_entire_calendar()
+        # Pobieramy tekst z przeklikanych tygodni
+        full_text_data = check_reservio_by_clicking()
         
-        # Analizujemy, czy gdziekolwiek w kodzie/tekście pojawia się wolne miejsce
-        current_state = has_available_place(big_text_data)
+        # Sprawdzamy czy gdziekolwiek w tych tygodniach pojawił się tekst "X miejsc dostępnych"
+        current_state = has_available_place(full_text_data)
 
-        print(f"[{now}] Wynik analizy (Dostępne miejsca w kalendarzu): {current_state}", flush=True)
+        print(f"[{now}] Wynik analizy (Dostępne miejsca w sprawdzanych tygodniach): {current_state}", flush=True)
 
         if current_state != last_state:
             if current_state:
                 notify(
-                    f"🚨 Reservio: Wykryto wolne miejsca na szkolenie (również w nadchodzących miesiącach)!\n\nLink do kalendarza: {URL}"
+                    f"🚨 Reservio: Wykryto wolne miejsca na szkolenie w sprawdzanych tygodniach!\n\nLink do kalendarza: {URL}"
                 )
             last_state = current_state
 
