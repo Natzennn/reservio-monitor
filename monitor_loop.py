@@ -5,108 +5,87 @@ import time
 import re
 from datetime import datetime
 
+# Konfiguracja bota
 URL = "https://test1874.reservio.com/events"
-CHECK_EVERY_SECONDS = 180
+CHECK_EVERY_SECONDS = 180  # Sprawdzanie dokładnie co 3 minuty
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
+# Zmienna przechowująca stan z poprzedniego sprawdzenia
 last_state = None
 
 
 def notify(text):
+    """Wysyła powiadomienie na Telegram z obsługą błędów sieciowych."""
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={
-                "chat_id": CHAT_ID,
-                "text": text
-            },
+            data={"chat_id": CHAT_ID, "text": text},
             timeout=20
         )
     except Exception as e:
-        print("Błąd Telegram:", e, flush=True)
+        print(f"Błąd Telegram: {e}", flush=True)
 
 
 def has_available_place(text):
+    """Sprawdza za pomocą Regex, czy w tekście strony są wolne miejsca."""
     matches = re.findall(
         r"\d+\s+(miejsce dostępne|miejsca dostępne|miejsc dostępnych)",
         text.lower()
     )
-
     return len(matches) > 0
 
 
-def get_page_text(page):
-    try:
-        page.goto(
-            URL,
-            wait_until="domcontentloaded",
-            timeout=30000
-        )
-    except Exception as e:
-        print("Goto warning:", e, flush=True)
+def check_reservio_once():
+    """Uruchamia czystą instancję Chromium, pobiera tekst strony i całkowicie ją zamyka.
 
-    try:
-        page.wait_for_timeout(10000)
-        return page.inner_text("body").lower()
-    except Exception as e:
-        print("Błąd odczytu tekstu:", e, flush=True)
-        return ""
+    Dzięki temu unikamy problemów z pamięcią podręczną (cache) i wyciekami
+    pamięci.
+    """
+    for attempt in range(3):
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu"
+                    ]
+                )
+                page = browser.new_page()
+                
+                # 'commit' gwarantuje, że nie utgniemy na ładujących się w tle skryptach śledzących
+                page.goto(URL, wait_until="commit", timeout=60000)
+                
+                # Kluczowe 10 sekund czekania – w tym czasie JS dociąga z bazy pomarańczowe klocki
+                page.wait_for_timeout(10000)
+                
+                # Pobieramy wyłącznie czysty tekst widoczny na ekranie
+                text = page.inner_text("body").lower()
+                browser.close()
+                return text
+        except Exception as e:
+            print(f"Próba {attempt + 1} nieudana: {e}", flush=True)
+            time.sleep(5)
+            
+    raise Exception("Nie udało się załadować i odczytać strony po 3 próbach.")
 
 
-notify("✅ Reservio monitor uruchomiony na Railway.")
+# Powiadomienie o restarcie bota na Railway
+notify("✅ Poprawiony monitor Reservio (Czysty start sesji) został uruchomiony.")
 
+# Główna pętla programu działająca 24/7
 while True:
     try:
-        print("Start pętli Playwright...", flush=True)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{now}] Rozpoczynam sprawdzanie strony...", flush=True)
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu"
-                ]
-            )
+        # Pobieramy tekst z nowo otwartej przeglądarki
+        text = check_reservio_once()
+        
+        # Analizujemy tekst pod kątem wolnych miejsc
+        current_state = has_available_place(text)
 
-            page = browser.new_page()
-
-            while True:
-                try:
-                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"[{now}] Sprawdzam stronę...", flush=True)
-
-                    text = get_page_text(page)
-
-                    current_state = has_available_place(text)
-
-                    print("Dostępne:", current_state, flush=True)
-
-                    if current_state != last_state:
-                        if current_state:
-                            notify(
-                                "🚨 Reservio: wykryto dostępne miejsce!\n"
-                                + URL
-                            )
-
-                        last_state = current_state
-
-                    print("Sprawdzono Reservio.", flush=True)
-
-                except Exception as e:
-                    print("Błąd w sprawdzaniu:", e, flush=True)
-
-                    try:
-                        page.close()
-                    except:
-                        pass
-
-                    page = browser.new_page()
-
-                time.sleep(CHECK_EVERY_SECONDS)
-
-    except Exception as e:
-        print("Duży błąd Playwright, restart za 30 sekund:", e, flush=True)
-        time.sleep(30)
+        print(f
