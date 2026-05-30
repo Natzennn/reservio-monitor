@@ -38,11 +38,7 @@ def has_available_place(text):
 
 
 def check_reservio_once():
-    """Uruchamia czystą instancję Chromium, pobiera tekst strony i całkowicie ją zamyka.
-
-    Dzięki temu unikamy problemów z pamięcią podręczną (cache) i wyciekami
-    pamięci.
-    """
+    """Uruchamia czystą instancję Chromium, pobiera tekst strony i całkowicie ją zamyka."""
     for attempt in range(3):
         try:
             with sync_playwright() as p:
@@ -56,10 +52,10 @@ def check_reservio_once():
                 )
                 page = browser.new_page()
                 
-                # 'commit' gwarantuje, że nie utgniemy na ładujących się w tle skryptach śledzących
+                # Stabilne 'commit' zapobiega timeoutom na skryptach śledzących
                 page.goto(URL, wait_until="commit", timeout=60000)
                 
-                # Kluczowe 10 sekund czekania – w tym czasie JS dociąga z bazy pomarańczowe klocki
+                # 10 sekund czekania na załadowanie dynamicznej zawartości przez JS
                 page.wait_for_timeout(10000)
                 
                 # Pobieramy wyłącznie czysty tekst widoczny na ekranie
@@ -88,4 +84,22 @@ while True:
         # Analizujemy tekst pod kątem wolnych miejsc
         current_state = has_available_place(text)
 
-        print(f
+        print(f"[{now}] Wynik analizy (Dostępne miejsca): {current_state}", flush=True)
+
+        # Jeśli stan się zmienił (np. ze statusu False na True)
+        if current_state != last_state:
+            if current_state:
+                notify(
+                    f"🚨 Reservio: Wykryto wolne miejsca na szkolenie!\n\nLink do zapisów: {URL}"
+                )
+            # Aktualizujemy stan, żeby nie spamować powiadomieniami co 3 minuty
+            last_state = current_state
+
+        print(f"[{now}] Cykl zakończony sukcesem. Zasypiam na {CHECK_EVERY_SECONDS}s.", flush=True)
+
+    except Exception as e:
+        # Ta linijka została skrócona i naprawiona:
+        print(f"Błąd pętli głównej: {e}", flush=True)
+
+    # Odczekanie 3 minut przed kolejnym pełnym uruchomieniem przeglądarki
+    time.sleep(CHECK_EVERY_SECONDS)
