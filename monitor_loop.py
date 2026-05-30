@@ -28,27 +28,27 @@ def notify(text):
         print(f"Błąd Telegram: {e}", flush=True)
 
 
-def has_available_place(text):
-    """NOWY REGEX: Wykrywa zarówno 'miejsca dostępne' jak i 'wolne miejsca'
+def extract_booking_links_from_html(html_content):
+    """Przeszukuje surowy kod źródłowy strony HTML w poszukiwaniu linków
 
-    z nowego widoku listy, który podesłałeś na screenach!
+    do rejestracji na wydarzenia. Wolne terminy MAJĄ aktywne linki href,
+    pełne terminy ich NIE MAJĄ.
     """
-    cleaned_text = text.lower()
+    # Szukamy wzorca linków widocznych na Twoich screenach z DevTools: /events/ID-WYDARZENIA
+    # Wykluczamy główny URL /events za pomocą znaku [^"]+ (musi być dalszy ciąg ID)
+    links = re.findall(r'href="/events/([a-zA-Z0-9\-]+)"', html_content)
     
-    # Szukamy: "X wolne miejsce/miejsca/miejsc" LUB "X miejsce/miejsca dostępne"
-    pattern = r"\d+\s+(wolne miejsce|wolne miejsca|wolnych miejsc|miejsce dostępne|miejsca dostępne|miejsc dostępnych)"
+    # Usuwamy ewentualne duplikaty
+    unique_links = list(set(links))
     
-    matches = re.findall(pattern, cleaned_text)
-    if len(matches) > 0:
-        print(f"-> Znalezione dopasowania fraz: {matches}", flush=True)
-    return len(matches) > 0
+    if unique_links:
+        print(f"-> Wykryto aktywne linki do zapisów (wolne miejsca!): {unique_links}", flush=True)
+    
+    return len(unique_links) > 0
 
 
-def check_reservio_perfect_scan():
-    """Wchodzi na stronę, przewija ją w dół (żeby załadować listę na całe miesiące w przód)
-
-    i pobiera pełny tekst.
-    """
+def check_reservio_html_source():
+    """Pobiera kompletny, surowy kod HTML strony po pełnym załadowaniu skryptów."""
     for attempt in range(3):
         try:
             with sync_playwright() as p:
@@ -64,44 +64,42 @@ def check_reservio_perfect_scan():
                 
                 # Wchodzimy na stronę
                 page.goto(URL, wait_until="commit", timeout=60000)
-                page.wait_for_timeout(6000)
                 
-                # Symulujemy przewijanie w dół, aby dynamiczna lista (infinite scroll) dociągnęła odległe terminy
-                for _ in range(3):
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    page.wait_for_timeout(1500)
+                # Dajemy 12 sekund na pełne dociągnięcie całego kalendarza w tle przez skrypty Next.js
+                page.wait_for_timeout(12000)
                 
-                # Pobieramy tekst ze skumulowanej, długiej listy wydarzeń
-                text_data = page.inner_text("body")
+                # Pobieramy pełny, surowy kod źródłowy HTML (zawiera też ukryte tagi i skrypty)
+                raw_html = page.content()
+                
                 browser.close()
-                return text_data
+                return raw_html
                 
         except Exception as e:
             print(f"Próba {attempt + 1} nieudana: {e}", flush=True)
             time.sleep(5)
             
-    raise Exception("Nie udało się pobrać danych ze strony po 3 próbach.")
+    raise Exception("Nie udało się pobrać kodu HTML strony po 3 próbach.")
 
 
-notify("✅ Ostateczny monitor (Wykrywanie 'wolnych miejsc' + Scroll) uruchomiony!")
+notify("🚨 Uruchomiono PANCERNY monitor HTML (Analiza linków rezerwacyjnych)...")
 
 while True:
     try:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{now}] Przeszukuję listę wydarzeń (cały kalendarz)...", flush=True)
+        print(f"[{now}] Pobieram i analizuję surowy kod HTML kalendarza...", flush=True)
 
-        # Pobieramy tekst z całej załadowanej listy nadchodzących treningów
-        full_text = check_reservio_perfect_scan()
+        # Pobieramy czysty kod HTML
+        html_source = check_reservio_html_source()
         
-        # Sprawdzamy obecność wolnych miejsc nowym, elastycznym regexem
-        current_state = has_available_place(full_text)
+        # Sprawdzamy czy w kodzie ukrywa się jakikolwiek aktywny link do formularza zapisu
+        current_state = extract_booking_links_from_html(html_source)
 
-        print(f"[{now}] Wynik analizy: {current_state}", flush=True)
+        print(f"[{now}] Wynik analizy kodu źródłowego: {current_state}", flush=True)
 
         if current_state != last_state:
             if current_state:
                 notify(
-                    f"🚨 Reservio: Wykryto wolne miejsca na szkolenie!\n\nSprawdź szybko kalendarz: {URL}"
+                    f"🚨 SYSTEM RESERVIO: Wykryto otwarte linki do zapisów! Ktoś zwolnił miejsce!\n\nRezerwuj tutaj: {URL}"
                 )
             last_state = current_state
 
