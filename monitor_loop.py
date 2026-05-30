@@ -28,27 +28,18 @@ def notify(text):
         print(f"Błąd Telegram: {e}", flush=True)
 
 
-def extract_booking_links_from_html(html_content):
-    """Przeszukuje surowy kod źródłowy strony HTML w poszukiwaniu linków
-
-    do rejestracji na wydarzenia. Wolne terminy MAJĄ aktywne linki href,
-    pełne terminy ich NIE MAJĄ.
-    """
-    # Szukamy wzorca linków widocznych na Twoich screenach z DevTools: /events/ID-WYDARZENIA
-    # Wykluczamy główny URL /events za pomocą znaku [^"]+ (musi być dalszy ciąg ID)
-    links = re.findall(r'href="/events/([a-zA-Z0-9\-]+)"', html_content)
-    
-    # Usuwamy ewentualne duplikaty
-    unique_links = list(set(links))
-    
-    if unique_links:
-        print(f"-> Wykryto aktywne linki do zapisów (wolne miejsca!): {unique_links}", flush=True)
-    
-    return len(unique_links) > 0
+def has_available_place(text):
+    """Szuka frazy 'wolne miejsce/miejsca' z widoku listy."""
+    cleaned_text = text.lower()
+    pattern = r"\d+\s+(wolne miejsce|wolne miejsca|wolnych miejsc|miejsce dostępne|miejsca dostępne)"
+    matches = re.findall(pattern, cleaned_text)
+    if len(matches) > 0:
+        print(f"-> Znaleziono wolne terminy! Szczegóły frazy: {matches}", flush=True)
+    return len(matches) > 0
 
 
-def check_reservio_html_source():
-    """Pobiera kompletny, surowy kod HTML strony po pełnym załadowaniu skryptów."""
+def check_reservio_force_list_view():
+    """Wchodzi na stronę, klika przycisk widoku listy i pobiera tekst."""
     for attempt in range(3):
         try:
             with sync_playwright() as p:
@@ -62,44 +53,74 @@ def check_reservio_html_source():
                 )
                 page = browser.new_page()
                 
-                # Wchodzimy na stronę
+                # Ustawiamy duży ekran, żeby ikony się nie schowały w wersji mobilnej
+                page.set_viewport_size({"width": 1920, "height": 1080})
+                
                 page.goto(URL, wait_until="commit", timeout=60000)
+                page.wait_for_timeout(6000)  # Czekamy na załadowanie strony
                 
-                # Dajemy 12 sekund na pełne dociągnięcie całego kalendarza w tle przez skrypty Next.js
-                page.wait_for_timeout(12000)
+                # KLIKANIE IKONY LISTY (w prawym górnym rogu)
+                # Na Twoim screenie przycisk listy to ostatni button w nawigacji widoków.
+                # Próbujemy kliknąć ikonę listy za pomocą elastycznych selektorów.
+                list_buttons = [
+                    "button:has(svg):right-of(button:has(svg))", # Przycisk po prawej stronie innego przycisku z ikoną
+                    "main header button:last-of-type",
+                    ".styles-module__calendarView___3w_TI+button",
+                    "button:has(svg)" # Fallback
+                ]
                 
-                # Pobieramy pełny, surowy kod źródłowy HTML (zawiera też ukryte tagi i skrypty)
-                raw_html = page.content()
+                clicked = False
+                for selector in list_buttons:
+                    try:
+                        elements = page.locator(selector)
+                        # Jeśli znaleźliśmy przyciski widoku, klikamy ostatni (widok listy)
+                        if elements.count() > 0:
+                            elements.last.click()
+                            clicked = True
+                            print(f"-> Kliknięto przełącznik widoku za pomocą: {selector}", flush=True)
+                            break
+                    except:
+                        continue
+                
+                if not clicked:
+                    print("-> Nie udało się kliknąć ikony (być może widok listy jest domyślny). Próbuję dalej...", flush=True)
+                
+                # Po ewentualnym kliknięciu czekamy 5 sekund, aż lista zaciągnie wydarzenia w dół
+                page.wait_for_timeout(5000)
+                
+                # Wykonujemy scroll w dół, żeby dociągnąć czerwiec i lipiec z listy
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(3000)
+                
+                # Wyciągamy wyrenderowany tekst ze zbudowanej listy
+                final_text = page.inner_text("body")
                 
                 browser.close()
-                return raw_html
+                return final_text
                 
         except Exception as e:
             print(f"Próba {attempt + 1} nieudana: {e}", flush=True)
             time.sleep(5)
             
-    raise Exception("Nie udało się pobrać kodu HTML strony po 3 próbach.")
+    raise Exception("Błąd podczas wymuszania widoku listy.")
 
 
-notify("🚨 Uruchomiono PANCERNY monitor HTML (Analiza linków rezerwacyjnych)...")
+notify("🚨 Uruchomiono monitor z wymuszaniem widoku listy (Force List View)...")
 
 while True:
     try:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{now}] Pobieram i analizuję surowy kod HTML kalendarza...", flush=True)
+        print(f"[{now}] Przełączam Reservio na widok listy i skanuję...", flush=True)
 
-        # Pobieramy czysty kod HTML
-        html_source = check_reservio_html_source()
-        
-        # Sprawdzamy czy w kodzie ukrywa się jakikolwiek aktywny link do formularza zapisu
-        current_state = extract_booking_links_from_html(html_source)
+        text_data = check_reservio_force_list_view()
+        current_state = has_available_place(text_data)
 
-        print(f"[{now}] Wynik analizy kodu źródłowego: {current_state}", flush=True)
+        print(f"[{now}] Wynik analizy: {current_state}", flush=True)
 
         if current_state != last_state:
             if current_state:
                 notify(
-                    f"🚨 SYSTEM RESERVIO: Wykryto otwarte linki do zapisów! Ktoś zwolnił miejsce!\n\nRezerwuj tutaj: {URL}"
+                    f"🚨 Reservio: Wykryto wolne miejsca na liście szkoleń!\n\nZapisy: {URL}"
                 )
             last_state = current_state
 
