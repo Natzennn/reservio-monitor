@@ -29,18 +29,25 @@ def notify(text):
 
 
 def has_available_place(text):
-    """Sprawdza za pomocą Regex, czy w wyrenderowanym tekście są wolne miejsca."""
-    matches = re.findall(
-        r"\d+\s+(miejsce dostępne|miejsca dostępne|miejsc dostępnych)",
-        text.lower()
-    )
+    """NOWY REGEX: Wykrywa zarówno 'miejsca dostępne' jak i 'wolne miejsca'
+
+    z nowego widoku listy, który podesłałeś na screenach!
+    """
+    cleaned_text = text.lower()
+    
+    # Szukamy: "X wolne miejsce/miejsca/miejsc" LUB "X miejsce/miejsca dostępne"
+    pattern = r"\d+\s+(wolne miejsce|wolne miejsca|wolnych miejsc|miejsce dostępne|miejsca dostępne|miejsc dostępnych)"
+    
+    matches = re.findall(pattern, cleaned_text)
+    if len(matches) > 0:
+        print(f"-> Znalezione dopasowania fraz: {matches}", flush=True)
     return len(matches) > 0
 
 
-def check_reservio_by_clicking():
-    """Otwiera stronę i klika strzałkę w prawo kilka razy, żeby wyrenderować
+def check_reservio_perfect_scan():
+    """Wchodzi na stronę, przewija ją w dół (żeby załadować listę na całe miesiące w przód)
 
-    nadchodzące tygodnie, po czym zbiera z nich skumulowany tekst.
+    i pobiera pełny tekst.
     """
     for attempt in range(3):
         try:
@@ -55,29 +62,19 @@ def check_reservio_by_clicking():
                 )
                 page = browser.new_page()
                 
-                # Wejście na stronę
+                # Wchodzimy na stronę
                 page.goto(URL, wait_until="commit", timeout=60000)
                 page.wait_for_timeout(6000)
                 
-                # Zbieramy tekst z 1. tygodnia (obecnego)
-                accumulated_text = page.inner_text("body").lower()
+                # Symulujemy przewijanie w dół, aby dynamiczna lista (infinite scroll) dociągnęła odległe terminy
+                for _ in range(3):
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    page.wait_for_timeout(1500)
                 
-                # Klikamy strzałkę "Dalej" (w prawo) 5 razy, żeby sprawdzić kolejnych 5 tygodni w przód!
-                # Selektory pasują do przycisków nawigacji kalendarza (szukamy ikony lub strzałki)
-                for i in range(5):
-                    try:
-                        # Próbuje kliknąć przycisk nawigacji (strzałkę w prawo)
-                        next_button = page.locator('button:has(svg), [aria-label*="next"], .next-button, .bi-chevron-right').first
-                        if next_button.count() > 0:
-                            next_button.click()
-                            page.wait_for_timeout(2000)  # Czekamy 2 sekundy na załadowanie nowego tygodnia
-                            # Doklejamy tekst z kolejnego tygodnia do naszego "worka"
-                            accumulated_text += " " + page.inner_text("body").lower()
-                    except Exception as click_err:
-                        print(f"Nie udało się kliknąć strzałki na kroku {i}: {click_err}", flush=True)
-                
+                # Pobieramy tekst ze skumulowanej, długiej listy wydarzeń
+                text_data = page.inner_text("body")
                 browser.close()
-                return accumulated_text
+                return text_data
                 
         except Exception as e:
             print(f"Próba {attempt + 1} nieudana: {e}", flush=True)
@@ -86,25 +83,25 @@ def check_reservio_by_clicking():
     raise Exception("Nie udało się pobrać danych ze strony po 3 próbach.")
 
 
-notify("✅ Poprawiony monitor klikający (Sprawdzanie tygodni w przód) wystartował.")
+notify("✅ Ostateczny monitor (Wykrywanie 'wolnych miejsc' + Scroll) uruchomiony!")
 
 while True:
     try:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{now}] Przeklikuję kalendarz na 5 tygodni w przód...", flush=True)
+        print(f"[{now}] Przeszukuję listę wydarzeń (cały kalendarz)...", flush=True)
 
-        # Pobieramy tekst z przeklikanych tygodni
-        full_text_data = check_reservio_by_clicking()
+        # Pobieramy tekst z całej załadowanej listy nadchodzących treningów
+        full_text = check_reservio_perfect_scan()
         
-        # Sprawdzamy czy gdziekolwiek w tych tygodniach pojawił się tekst "X miejsc dostępnych"
-        current_state = has_available_place(full_text_data)
+        # Sprawdzamy obecność wolnych miejsc nowym, elastycznym regexem
+        current_state = has_available_place(full_text)
 
-        print(f"[{now}] Wynik analizy (Dostępne miejsca w sprawdzanych tygodniach): {current_state}", flush=True)
+        print(f"[{now}] Wynik analizy: {current_state}", flush=True)
 
         if current_state != last_state:
             if current_state:
                 notify(
-                    f"🚨 Reservio: Wykryto wolne miejsca na szkolenie w sprawdzanych tygodniach!\n\nLink do kalendarza: {URL}"
+                    f"🚨 Reservio: Wykryto wolne miejsca na szkolenie!\n\nSprawdź szybko kalendarz: {URL}"
                 )
             last_state = current_state
 
