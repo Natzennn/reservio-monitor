@@ -5,128 +5,106 @@ import time
 import re
 from datetime import datetime
 
-# Konfiguracja bota
+# Konfiguracja bota (powrót do Reservio)
 URL = "https://test1874.reservio.com/events"
 CHECK_EVERY_SECONDS = 180  # Sprawdzanie co 3 minuty
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
-# Zmienna przechowująca stan z poprzedniego sprawdzenia
-last_state = None
+last_alert = None
 
 
 def notify(text):
-    """Wysyła powiadomienie na Telegram."""
+    """Wysyła powiadomienie na Telegram z obsługą błędów."""
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             data={"chat_id": CHAT_ID, "text": text},
-            timeout=20
+            timeout=20,
         )
     except Exception as e:
         print(f"Błąd Telegram: {e}", flush=True)
 
 
-def has_available_place(text):
-    """Szuka frazy 'wolne miejsce/miejsca' z widoku listy."""
-    cleaned_text = text.lower()
-    pattern = r"\d+\s+(wolne miejsce|wolne miejsca|wolnych miejsc|miejsce dostępne|miejsca dostępne)"
-    matches = re.findall(pattern, cleaned_text)
-    if len(matches) > 0:
-        print(f"-> Znaleziono wolne terminy! Szczegóły frazy: {matches}", flush=True)
-    return len(matches) > 0
+def check_reservio_like_velo():
+    """Uruchamia czystą sesję przeglądarki o wysokiej rozdzielczości,
 
+    czeka na stabilne załadowanie widżetów Reservio i szuka jakichkolwiek wolnych terminów.
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu"
+            ]
+        )
 
-def check_reservio_force_list_view():
-    """Wchodzi na stronę, klika przycisk widoku listy i pobiera tekst."""
-    for attempt in range(3):
+        # Tworzymy duży ekran (FullHD), żeby Reservio załadowało pełny widok z kalendarzem bocznym
+        page = browser.new_page(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+
+        # Odpowiednik wait_until="networkidle" z Veloart - czekamy na załadowanie skryptów w tle
+        page.goto(URL, wait_until="networkidle", timeout=60000)
+        page.wait_for_timeout(8000)  # Dodatkowe sekundy na stabilizację React/Next.js
+
+        # Akceptujemy "Rozumiem" lub politykę prywatności, jeśli zasłania ekran (jak w Veloart)
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu"
-                    ]
-                )
-                page = browser.new_page()
-                
-                # Ustawiamy duży ekran, żeby ikony się nie schowały w wersji mobilnej
-                page.set_viewport_size({"width": 1920, "height": 1080})
-                
-                page.goto(URL, wait_until="commit", timeout=60000)
-                page.wait_for_timeout(6000)  # Czekamy na załadowanie strony
-                
-                # KLIKANIE IKONY LISTY (w prawym górnym rogu)
-                # Na Twoim screenie przycisk listy to ostatni button w nawigacji widoków.
-                # Próbujemy kliknąć ikonę listy za pomocą elastycznych selektorów.
-                list_buttons = [
-                    "button:has(svg):right-of(button:has(svg))", # Przycisk po prawej stronie innego przycisku z ikoną
-                    "main header button:last-of-type",
-                    ".styles-module__calendarView___3w_TI+button",
-                    "button:has(svg)" # Fallback
-                ]
-                
-                clicked = False
-                for selector in list_buttons:
-                    try:
-                        elements = page.locator(selector)
-                        # Jeśli znaleźliśmy przyciski widoku, klikamy ostatni (widok listy)
-                        if elements.count() > 0:
-                            elements.last.click()
-                            clicked = True
-                            print(f"-> Kliknięto przełącznik widoku za pomocą: {selector}", flush=True)
-                            break
-                    except:
-                        continue
-                
-                if not clicked:
-                    print("-> Nie udało się kliknąć ikony (być może widok listy jest domyślny). Próbuję dalej...", flush=True)
-                
-                # Po ewentualnym kliknięciu czekamy 5 sekund, aż lista zaciągnie wydarzenia w dół
-                page.wait_for_timeout(5000)
-                
-                # Wykonujemy scroll w dół, żeby dociągnąć czerwiec i lipiec z listy
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(3000)
-                
-                # Wyciągamy wyrenderowany tekst ze zbudowanej listy
-                final_text = page.inner_text("body")
-                
-                browser.close()
-                return final_text
-                
-        except Exception as e:
-            print(f"Próba {attempt + 1} nieudana: {e}", flush=True)
-            time.sleep(5)
-            
-    raise Exception("Błąd podczas wymuszania widoku listy.")
+            page.get_by_text("Rozumiem").click(timeout=3000)
+        except Exception:
+            pass
+
+        # Pobieramy pełny tekst wyrenderowany na ekranie (widok listy/kalendarza)
+        text = page.locator("body").inner_text()
+        browser.close()
+
+        # Szukamy JAKIEGOKOLWIEK śladu wolnego miejsca (na podstawie Twoich 3 screenów)
+        # Szukamy: "X wolne miejsce", "X wolne miejsca", "X wolnych miejsc", "X miejsce dostępne" lub przycisku "ZAREZERWUJ"
+        match = re.search(
+            r"(\d+\s+(wolne miejsce|wolne miejsca|wolnych miejsc|miejsce dostępne|miejsca dostępne))|zarezerwuj",
+            text.lower()
+        )
+
+        if match:
+            # Wyciągamy fragment tekstu wokół znalezionego miejsca, żeby wiedzieć co to za termin
+            matched_text = match.group(0)
+            return True, matched_text
+        
+        return False, None
 
 
-notify("🚨 Uruchomiono monitor z wymuszaniem widoku listy (Force List View)...")
+# Start bota
+notify("✅ Monitor Reservio (Logika Veloart) został uruchomiony. Szukam wolnych miejsc...")
+print("Start Reservio-Velo monitora.", flush=True)
 
 while True:
     try:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{now}] Przełączam Reservio na widok listy i skanuję...", flush=True)
+        print(f"[{now}] Sprawdzam Reservio logiką Veloart...", flush=True)
 
-        text_data = check_reservio_force_list_view()
-        current_state = has_available_place(text_data)
+        found_spots, details = check_reservio_like_velo()
 
-        print(f"[{now}] Wynik analizy: {current_state}", flush=True)
-
-        if current_state != last_state:
-            if current_state:
+        if found_spots:
+            print(f"[{now}] SUKCES! Znaleziono wolne miejsca: {details}", flush=True)
+            
+            # Zapobiegamy powtarzaniu tego samego alertu co 3 minuty
+            if details != last_alert:
                 notify(
-                    f"🚨 Reservio: Wykryto wolne miejsca na liście szkoleń!\n\nZapisy: {URL}"
+                    "🚨 *RESERVIO: POJAWIŁO SIĘ WOLNE MIEJSCE!*\n\n"
+                    f"💬 Komunikat z systemu: *{details}*\n"
+                    "Złapano wolny termin w kalendarzu bocznum lub na liście.\n\n"
+                    f"🔗 Rezerwuj szybko tutaj: {URL}"
                 )
-            last_state = current_state
-
-        print(f"[{now}] Cykl zakończony. Zasypiam na {CHECK_EVERY_SECONDS}s.", flush=True)
+                last_alert = details
+        else:
+            print(f"[{now}] Brak wolnych miejsc w tym cyklu. Kalendarz jest pełny.", flush=True)
 
     except Exception as e:
         print(f"Błąd pętli głównej: {e}", flush=True)
 
+    print(f"Zasypiam na {CHECK_EVERY_SECONDS} sekund...", flush=True)
     time.sleep(CHECK_EVERY_SECONDS)
