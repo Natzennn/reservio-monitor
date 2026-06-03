@@ -9,12 +9,41 @@ BASE_URL = "https://ttsd.reservio.com/events"
 
 CHECK_EVERY_SECONDS = 180
 SCAN_DAYS_AHEAD = 90
-PAGE_WAIT_MS = 6000
+PAGE_WAIT_MS = 7000
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
 last_found_details = None
+
+
+POLISH_MONTHS = {
+    "sty": 1,
+    "stycznia": 1,
+    "lut": 2,
+    "lutego": 2,
+    "mar": 3,
+    "marca": 3,
+    "kwi": 4,
+    "kwietnia": 4,
+    "maj": 5,
+    "maja": 5,
+    "cze": 6,
+    "czerwca": 6,
+    "lip": 7,
+    "lipca": 7,
+    "sie": 8,
+    "sierpnia": 8,
+    "wrz": 9,
+    "września": 9,
+    "paz": 10,
+    "paź": 10,
+    "października": 10,
+    "lis": 11,
+    "listopada": 11,
+    "gru": 12,
+    "grudnia": 12,
+}
 
 
 def notify(text):
@@ -39,10 +68,6 @@ def notify(text):
         print(f"Błąd Telegram: {e}", flush=True)
 
 
-def build_day_url(day):
-    return f"{BASE_URL}?day={day.strftime('%Y-%m-%d')}"
-
-
 def normalize_text(text):
     return (
         text.replace("\xa0", " ")
@@ -52,36 +77,165 @@ def normalize_text(text):
     )
 
 
-def parse_available_events(full_text, checked_day):
-    full_text = normalize_text(full_text)
-    text_lower = full_text.lower()
+def parse_polish_event_date(line):
+    """
+    Obsługuje np.:
+    Sobota, cze 13, 2026
+    Środa, cze 03, 2026
+    """
 
-    if "w tym dniu nie ma żadnych wydarzeń" in text_lower:
-        return []
-
-    lines = [line.strip() for line in full_text.splitlines() if line.strip()]
-    found_events = []
-
-    availability_regex = re.compile(
-        r"\b\d+\s*(?:wolne miejsce|wolne miejsca|wolnych miejsc)\b",
+    pattern = re.compile(
+        r"^(?:poniedziałek|wtorek|środa|czwartek|piątek|sobota|niedziela),\s+"
+        r"([a-ząćęłńóśźż]+)\s+(\d{1,2}),\s+(\d{4})$",
         re.IGNORECASE,
     )
 
-    for idx, line in enumerate(lines):
-        if availability_regex.search(line):
-            start = max(0, idx - 5)
-            end = min(len(lines), idx + 5)
+    match = pattern.search(line.strip())
+    if not match:
+        return None
 
-            context_lines = lines[start:end]
-            context_text = " | ".join(context_lines)
-            context_lower = context_text.lower()
+    month_name = match.group(1).lower()
+    day_number = int(match.group(2))
+    year_number = int(match.group(3))
 
-            if "pełne obłożenie" in context_lower:
-                continue
+    month_number = POLISH_MONTHS.get(month_name)
+    if not month_number:
+        return None
 
+    return date(year_number, month_number, day_number)
+
+
+def click_upcoming_events_if_needed(page):
+    """
+    Na tej stronie Reservio parametr ?day= może zostać zignorowany.
+    Jeśli pojawia się przycisk 'POKAŻ NADCHODZĄCE WYDARZENIA',
+    klikamy go, żeby załadować realną listę wydarzeń.
+    """
+
+    possible_buttons = [
+        "POKAŻ NADCHODZĄCE WYDARZENIA",
+        "Pokaż nadchodzące wydarzenia",
+        "NADCHODZĄCE WYDARZENIA",
+        "Pokaż więcej",
+        "POKAŻ WIĘCEJ",
+    ]
+
+    for button_text in possible_buttons:
+        try:
+            button = page.get_by_text(button_text, exact=False).first()
+
+            if button.count() > 0 and button.is_visible():
+                print(f"Klikam przycisk: {button_text}", flush=True)
+                button.click(timeout=10000)
+                page.wait_for_timeout(PAGE_WAIT_MS)
+                return True
+
+        except Exception:
+            pass
+
+    return False
+
+
+def click_load_more_until_done(page, max_clicks=10):
+    """
+    Jeżeli Reservio pokazuje kolejne wydarzenia po kliknięciu
+    'Pokaż więcej' albo podobnego przycisku, klikamy kilka razy.
+    """
+
+    for _ in range(max_clicks):
+        clicked = False
+
+        for button_text in [
+            "POKAŻ WIĘCEJ",
+            "Pokaż więcej",
+            "WIĘCEJ",
+            "Pokaż następne",
+            "NASTĘPNE",
+        ]:
+            try:
+                button = page.get_by_text(button_text, exact=False).first()
+
+                if button.count() > 0 and button.is_visible():
+                    print(f"Klikam dodatkowy przycisk: {button_text}", flush=True)
+                    button.click(timeout=10000)
+                    page.wait_for_timeout(PAGE_WAIT_MS)
+                    clicked = True
+                    break
+
+            except Exception:
+                pass
+
+        if not clicked:
+            break
+
+
+def parse_available_events_from_visible_text(full_text):
+    """
+    Parser pod widok ze screena:
+
+    Sobota, cze 13, 2026
+    Pistolet w samoobronie (CCW) [FSO]
+    10:00 - 12:00 • 2 wolne miejsca • Dominik
+    120 zł
+    ZAREZERWUJ
+    """
+
+    full_text = normalize_text(full_text)
+    lines = [line.strip() for line in full_text.splitlines() if line.strip()]
+
+    today = date.today()
+    max_day = today + timedelta(days=SCAN_DAYS_AHEAD)
+
+    found_events = []
+    current_event_date = None
+    current_block = []
+
+    def flush_block():
+        nonlocal current_block, current_event_date
+
+        if not current_block or not current_event_date:
+            current_block = []
+            return
+
+        if current_event_date < today or current_event_date > max_day:
+            current_block = []
+            return
+
+        block_text = " | ".join(current_block)
+        block_lower = block_text.lower()
+
+        has_free_places = re.search(
+            r"\b\d+\s*(?:wolne miejsce|wolne miejsca|wolnych miejsc)\b",
+            block_lower,
+            re.IGNORECASE,
+        )
+
+        has_reserve_button = "zarezerwuj" in block_lower
+
+        if has_free_places and has_reserve_button and "pełne obłożenie" not in block_lower:
             found_events.append(
-                f"{checked_day.strftime('%Y-%m-%d')} | {context_text}"
+                f"{current_event_date.strftime('%Y-%m-%d')} | {block_text}"
             )
+
+        current_block = []
+
+    for line in lines:
+        parsed_date = parse_polish_event_date(line)
+
+        if parsed_date:
+            flush_block()
+            current_event_date = parsed_date
+            current_block = [line]
+            continue
+
+        if current_event_date:
+            current_block.append(line)
+
+            if line.upper() == "ZAREZERWUJ":
+                flush_block()
+                current_block = [f"Data: {current_event_date.strftime('%Y-%m-%d')}"]
+
+    flush_block()
 
     unique_events = []
     seen = set()
@@ -98,7 +252,6 @@ def parse_available_events(full_text, checked_day):
 
 def scan_calendar_once():
     all_found_events = []
-    today = date.today()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -113,45 +266,38 @@ def scan_calendar_once():
             }
         )
 
-        for offset in range(SCAN_DAYS_AHEAD + 1):
-            checked_day = today + timedelta(days=offset)
-            checked_day_str = checked_day.strftime("%Y-%m-%d")
-            url = build_day_url(checked_day)
+        try:
+            print(f"Otwieram stronę: {BASE_URL}", flush=True)
 
-            try:
-                print(f"Sprawdzam dzień: {checked_day_str}", flush=True)
+            page.goto(
+                BASE_URL,
+                wait_until="commit",
+                timeout=60000,
+            )
 
-                page.goto(
-                    url,
-                    wait_until="commit",
-                    timeout=60000,
-                )
+            page.wait_for_timeout(PAGE_WAIT_MS)
 
-                page.wait_for_timeout(PAGE_WAIT_MS)
+            click_upcoming_events_if_needed(page)
+            click_load_more_until_done(page)
 
-                full_text = page.locator("body").inner_text(timeout=20000)
-                full_text = normalize_text(full_text)
+            full_text = page.locator("body").inner_text(timeout=20000)
+            full_text = normalize_text(full_text)
 
-                if checked_day_str == "2026-06-13":
-                    print("========== DEBUG 2026-06-13 ==========", flush=True)
-                    print(full_text[:3000], flush=True)
-                    print("========== KONIEC DEBUG ==========", flush=True)
+            print("========== DEBUG TEKST STRONY ==========", flush=True)
+            print(full_text[:5000], flush=True)
+            print("========== KONIEC DEBUG ==========", flush=True)
 
-                events = parse_available_events(full_text, checked_day)
+            events = parse_available_events_from_visible_text(full_text)
 
-                if events:
-                    print(f"Znaleziono wolne miejsca dla {checked_day_str}", flush=True)
+            if events:
+                for event in events:
+                    print(f"Znaleziono: {event}", flush=True)
+                    all_found_events.append(event)
+            else:
+                print("Nie znaleziono wolnych miejsc w widocznym tekście.", flush=True)
 
-                    for event in events:
-                        print(event, flush=True)
-                        all_found_events.append(event)
-                else:
-                    print(f"Brak miejsc dla {checked_day_str}", flush=True)
-
-            except Exception as e:
-                print(f"Błąd przy dniu {checked_day_str}: {e}", flush=True)
-
-        browser.close()
+        finally:
+            browser.close()
 
     return all_found_events
 
@@ -164,7 +310,7 @@ def main():
     while True:
         try:
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{now}] Start skanowania 3 miesięcy do przodu...", flush=True)
+            print(f"[{now}] Start skanowania wydarzeń 3 miesiące do przodu...", flush=True)
 
             events = scan_calendar_once()
 
@@ -191,7 +337,7 @@ def main():
                 print("Dostępne: False", flush=True)
                 last_found_details = None
 
-            print("Zakończono skanowanie 3 miesięcy.", flush=True)
+            print("Zakończono skanowanie.", flush=True)
 
         except Exception as e:
             print(f"Błąd głównej pętli: {e}", flush=True)
