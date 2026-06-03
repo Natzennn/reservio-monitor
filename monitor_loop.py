@@ -1,594 +1,631 @@
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import requests
 import os
 import time
 import re
-from datetime import datetime
+import json
+import hashlib
+from datetime import datetime, date
 
-URL = "https://ttsd.reservio.com/events"
 
-CHECK_EVERY_SECONDS = 180
-WAIT_MS = 5000
+URL = os.environ.get("RESERVIO_URL", "https://ttsd.reservio.com/events")
+
+CHECK_EVERY_SECONDS = int(os.environ.get("CHECK_EVERY_SECONDS", "60"))
+SCAN_MONTHS_AHEAD = int(os.environ.get("SCAN_MONTHS_AHEAD", "3"))
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
-last_alert = None
+STATE_FILE = "last_alert_state.json"
 
-MONTHS_PL = {
-    "stycznia": "sty",
-    "lutego": "lut",
-    "marca": "mar",
-    "kwietnia": "kwi",
-    "maja": "maj",
-    "czerwca": "cze",
-    "lipca": "lip",
-    "sierpnia": "sie",
-    "września": "wrz",
-    "października": "paź",
-    "pazdziernika": "paź",
-    "listopada": "lis",
-    "grudnia": "gru",
+
+POLISH_MONTHS = {
+    "styczeń": 1,
+    "stycznia": 1,
+    "sty": 1,
+
+    "luty": 2,
+    "lutego": 2,
+    "lut": 2,
+
+    "marzec": 3,
+    "marca": 3,
+    "mar": 3,
+
+    "kwiecień": 4,
+    "kwietnia": 4,
+    "kwi": 4,
+
+    "maj": 5,
+    "maja": 5,
+
+    "czerwiec": 6,
+    "czerwca": 6,
+    "cze": 6,
+
+    "lipiec": 7,
+    "lipca": 7,
+    "lip": 7,
+
+    "sierpień": 8,
+    "sierpnia": 8,
+    "sie": 8,
+
+    "wrzesień": 9,
+    "września": 9,
+    "wrz": 9,
+
+    "październik": 10,
+    "października": 10,
+    "pazdziernik": 10,
+    "pazdziernika": 10,
+    "paź": 10,
+    "paz": 10,
+
+    "listopad": 11,
+    "listopada": 11,
+    "lis": 11,
+
+    "grudzień": 12,
+    "grudnia": 12,
+    "gru": 12,
 }
 
 
-def notify(text):
-    try:
-        response = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={
-                "chat_id": CHAT_ID,
-                "text": text,
-                "disable_web_page_preview": True,
-            },
-            timeout=20,
-        )
+AVAILABILITY_RE = re.compile(
+    r"(?P<count>\d+)\s+"
+    r"(?P<label>"
+    r"miejsce dostępne|"
+    r"miejsca dostępne|"
+    r"miejsc dostępnych|"
+    r"wolne miejsce|"
+    r"wolne miejsca|"
+    r"wolnych miejsc"
+    r")",
+    re.IGNORECASE,
+)
 
-        if not response.ok:
-            print(f"Błąd Telegram HTTP {response.status_code}: {response.text}", flush=True)
+TIME_RE = re.compile(
+    r"(?P<time>\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2})"
+)
 
-    except Exception as e:
-        print(f"Błąd Telegram: {e}", flush=True)
-
-
-def normalize_text(text):
-    return (
-        text.replace("\xa0", " ")
-        .replace("\u202f", " ")
-        .replace("\u2009", " ")
-        .replace("\u200b", "")
-        .strip()
-    )
+FULL_RE = re.compile(
+    r"pełne obłożenie|brak miejsc|wyprzedane",
+    re.IGNORECASE,
+)
 
 
-def click_button_if_exists(page, text):
-    selectors = [
-        f'button:has-text("{text}")',
-        f'a:has-text("{text}")',
-        f'text="{text}"',
+def add_months(d: date, months: int) -> date:
+    month = d.month - 1 + months
+    year = d.year + month // 12
+    month = month % 12 + 1
+
+    days_in_month = [
+        31,
+        29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28,
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
     ]
 
-    for selector in selectors:
-        try:
-            locator = page.locator(selector).first
-
-            if locator.count() > 0 and locator.is_visible():
-                print(f"Klikam: {text}", flush=True)
-
-                try:
-                    locator.scroll_into_view_if_needed(timeout=5000)
-                except Exception:
-                    pass
-
-                locator.click(timeout=10000, force=True)
-                page.wait_for_timeout(WAIT_MS)
-                return True
-
-        except Exception as e:
-            print(f"Nie udało się kliknąć {text} przez {selector}: {e}", flush=True)
-
-    return False
+    day = min(d.day, days_in_month[month - 1])
+    return date(year, month, day)
 
 
-def get_next_event_date_hint(text):
-    """
-    Z komunikatu:
-    Następne wydarzenie odbędzie się czerwca 13, 2026
-    robi:
-    cze 13, 2026
-    """
+def normalize_text(text: str) -> str:
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
-    text = normalize_text(text)
 
-    match = re.search(
-        r"Następne wydarzenie odbędzie się\s+([a-ząćęłńóśźż]+)\s+(\d{1,2}),\s+(\d{4})",
+def notify(text: str):
+    response = requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        data={
+            "chat_id": CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": True,
+        },
+        timeout=20,
+    )
+
+    if response.status_code >= 400:
+        raise Exception(f"Telegram error {response.status_code}: {response.text}")
+
+
+def load_last_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_last_state(state):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Nie udało się zapisać state: {e}", flush=True)
+
+
+def state_hash(events):
+    raw = json.dumps(events, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def parse_polish_date_from_text(text: str):
+    text = normalize_text(text.lower())
+
+    patterns = [
+        # czerwca 13, 2026
+        r"\b(?P<month>[a-ząćęłńóśźż]+)\s+(?P<day>\d{1,2}),\s*(?P<year>\d{4})\b",
+
+        # 13 czerwca 2026
+        r"\b(?P<day>\d{1,2})\s+(?P<month>[a-ząćęłńóśźż]+)\s+(?P<year>\d{4})\b",
+
+        # 13 cze 2026
+        r"\b(?P<day>\d{1,2})\s+(?P<month>[a-ząćęłńóśźż]{3})\s+(?P<year>\d{4})\b",
+    ]
+
+    for pattern in patterns:
+        for m in re.finditer(pattern, text, re.IGNORECASE):
+            month_name = m.group("month").strip().lower()
+            month = POLISH_MONTHS.get(month_name)
+
+            if not month:
+                continue
+
+            try:
+                return date(
+                    int(m.group("year")),
+                    month,
+                    int(m.group("day")),
+                )
+            except ValueError:
+                continue
+
+    return None
+
+
+def parse_next_event_fallback_date(page_text: str):
+    text = normalize_text(page_text.lower())
+
+    m = re.search(
+        r"następne wydarzenie odbędzie się\s+(.+?)(?:\.|\n)",
         text,
         re.IGNORECASE,
     )
 
-    if not match:
+    if not m:
         return None
 
-    month_long = match.group(1).lower()
-    day = match.group(2)
-    year = match.group(3)
-
-    month_short = MONTHS_PL.get(month_long, month_long)
-
-    return f"{month_short} {day}, {year}"
-
-
-def load_events(page):
-    body_text = normalize_text(page.locator("body").inner_text(timeout=20000))
-
-    if "POKAŻ NADCHODZĄCE WYDARZENIA" in body_text:
-        click_button_if_exists(page, "POKAŻ NADCHODZĄCE WYDARZENIA")
-
-    for _ in range(5):
-        page.wait_for_timeout(1500)
-
-        try:
-            page.mouse.wheel(0, 2500)
-            page.wait_for_timeout(1000)
-        except Exception:
-            pass
-
-        body_text = normalize_text(page.locator("body").inner_text(timeout=20000))
-
-        if "POKAŻ WSZYSTKIE WYDARZENIA" in body_text:
-            if click_button_if_exists(page, "POKAŻ WSZYSTKIE WYDARZENIA"):
-                continue
-
-        if "POKAŻ WIĘCEJ" in body_text:
-            if click_button_if_exists(page, "POKAŻ WIĘCEJ"):
-                continue
-
-        break
-
-
-def extract_events_from_dom(page, fallback_date):
-    events = page.evaluate(
-        """
-        () => {
-            function clean(text) {
-                return (text || "")
-                    .replace(/\\u00a0/g, " ")
-                    .replace(/\\u202f/g, " ")
-                    .replace(/\\u2009/g, " ")
-                    .replace(/\\u200b/g, "")
-                    .trim();
-            }
-
-            const dateRegex = /^(poniedziałek|wtorek|środa|czwartek|piątek|sobota|niedziela),\\s+(sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\\s+\\d{1,2},\\s+\\d{4}$/i;
-
-            const availabilityRegex = /\\b\\d+\\s*(wolne miejsce|wolne miejsca|wolnych miejsc|miejsce dostępne|miejsca dostępne|miejsc dostępnych)\\b/i;
-
-            const timeRegex = /\\b\\d{1,2}:\\d{2}\\s*-\\s*\\d{1,2}:\\d{2}\\b/;
-
-            function isVisible(el) {
-                const style = window.getComputedStyle(el);
-                const rect = el.getBoundingClientRect();
-
-                return (
-                    style.display !== "none" &&
-                    style.visibility !== "hidden" &&
-                    rect.width > 0 &&
-                    rect.height > 0
-                );
-            }
-
-            function isNoise(line) {
-                const lower = line.toLowerCase();
-
-                if (!lower || lower === "/") return true;
-                if (/^\\d+$/.test(lower)) return true;
-                if (/^\\d+\\s*zł$/i.test(line)) return true;
-                if (dateRegex.test(line)) return true;
-                if (timeRegex.test(line)) return true;
-                if (availabilityRegex.test(line)) return true;
-
-                const noise = [
-                    "szczegóły",
-                    "pokaż szczegóły",
-                    "zarezerwuj",
-                    "pełne obłożenie",
-                    "zaloguj się",
-                    "z powrotem",
-                    "strona główna",
-                    "wydarzenia",
-                    "szukaj",
-                    "wybierz dzień",
-                    "obsługiwane przez",
-                    "reservio",
-                    "copyright",
-                    "wszelkie prawa zastrzeżone",
-                    "masz własny biznes",
-                    "wypróbuj reservio",
-                    "pokaż nadchodzące wydarzenia",
-                    "pokaż wszystkie wydarzenia",
-                    "pokaż więcej"
-                ];
-
-                return noise.some(x => lower.includes(x));
-            }
-
-            function findBestEventRow(startEl) {
-                let el = startEl;
-
-                while (el && el !== document.body) {
-                    const text = clean(el.innerText);
-                    const lines = text.split("\\n").map(clean).filter(Boolean);
-
-                    const hasAvailability = availabilityRegex.test(text);
-                    const hasTime = timeRegex.test(text);
-                    const isFull = /pełne obłożenie/i.test(text);
-
-                    if (hasAvailability && hasTime && !isFull && lines.length <= 12) {
-                        return el;
-                    }
-
-                    el = el.parentElement;
-                }
-
-                return null;
-            }
-
-            function findDateForRow(row) {
-                const rowTop = row.getBoundingClientRect().top + window.scrollY;
-
-                const candidates = Array.from(document.querySelectorAll("h1,h2,h3,h4,div,span"))
-                    .filter(isVisible)
-                    .map(el => {
-                        const text = clean(el.innerText);
-                        const lines = text.split("\\n").map(clean).filter(Boolean);
-
-                        if (lines.length !== 1) return null;
-                        if (!dateRegex.test(lines[0])) return null;
-
-                        return {
-                            text: lines[0],
-                            top: el.getBoundingClientRect().top + window.scrollY
-                        };
-                    })
-                    .filter(Boolean)
-                    .filter(item => item.top <= rowTop + 10)
-                    .sort((a, b) => b.top - a.top);
-
-                if (candidates.length > 0) {
-                    return candidates[0].text;
-                }
-
-                return "";
-            }
-
-            const allVisible = Array.from(document.querySelectorAll("body *")).filter(isVisible);
-
-            const availabilityNodes = allVisible.filter(el => {
-                const text = clean(el.innerText);
-                if (!text) return false;
-                if (!availabilityRegex.test(text)) return false;
-                if (/pełne obłożenie/i.test(text)) return false;
-                return true;
-            });
-
-            const rows = [];
-
-            for (const node of availabilityNodes) {
-                const row = findBestEventRow(node);
-                if (!row) continue;
-
-                if (!rows.includes(row)) {
-                    rows.push(row);
-                }
-            }
-
-            const found = [];
-
-            for (const row of rows) {
-                const text = clean(row.innerText);
-                const lines = text.split("\\n").map(clean).filter(Boolean);
-
-                if (/pełne obłożenie/i.test(text)) continue;
-
-                const availability = lines.find(line => availabilityRegex.test(line)) || "";
-                const time = lines.find(line => timeRegex.test(line)) || "Godzina nieznana";
-
-                let title = "";
-
-                for (const line of lines) {
-                    if (isNoise(line)) continue;
-                    title = line;
-                    break;
-                }
-
-                if (!title) {
-                    title = "Wydarzenie nieznane";
-                }
-
-                const eventDate = findDateForRow(row);
-
-                found.push({
-                    date: eventDate,
-                    time,
-                    title,
-                    availability
-                });
-            }
-
-            const unique = [];
-            const seen = new Set();
-
-            for (const event of found) {
-                const key = `${event.date}|${event.time}|${event.title}|${event.availability}`.toLowerCase();
-
-                if (!seen.has(key)) {
-                    seen.add(key);
-                    unique.push(event);
-                }
-            }
-
-            return unique;
-        }
-        """
-    )
-
-    clean_events = []
-
-    for event in events:
-        date_text = normalize_text(event.get("date", ""))
-
-        if not date_text:
-            if fallback_date:
-                date_text = fallback_date
-            else:
-                date_text = "Data nieznana"
-
-        time_text = normalize_text(event.get("time", "Godzina nieznana"))
-        title_text = normalize_text(event.get("title", "Wydarzenie nieznane"))
-        availability_text = normalize_text(event.get("availability", ""))
-
-        if not availability_text:
-            continue
-
-        clean_events.append(
-            f"{date_text} | {time_text} | {title_text} | {availability_text}"
-        )
-
-    return clean_events
-
-
-def extract_events_from_text_fallback(page, fallback_date):
-    text = normalize_text(page.locator("body").inner_text(timeout=20000))
-
-    lines = [
-        normalize_text(line)
-        for line in text.splitlines()
-        if normalize_text(line)
-    ]
-
-    date_regex = re.compile(
-        r"^(poniedziałek|wtorek|środa|czwartek|piątek|sobota|niedziela),\s+"
-        r"(sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\s+"
-        r"\d{1,2},\s+\d{4}$",
-        re.IGNORECASE,
-    )
-
-    time_regex = re.compile(
-        r"\b\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}\b"
-    )
-
-    availability_regex = re.compile(
-        r"\b\d+\s*(?:"
-        r"wolne miejsce|wolne miejsca|wolnych miejsc|"
-        r"miejsce dostępne|miejsca dostępne|miejsc dostępnych"
-        r")\b",
-        re.IGNORECASE,
-    )
-
-    found = []
-
-    current_date = fallback_date or None
-    current_title = None
-    current_time = None
-    current_availability = None
-    current_is_full = False
-
-    noise = {
-        "tanie treningi strzelectwa dynamicznego",
-        "przemysław",
-        "z powrotem",
-        "strona główna",
-        "/",
-        "wydarzenia",
-        "szukaj...",
-        "pokaż szczegóły",
-        "wybierz dzień",
-        "obsługiwane przez",
-        "reservio business",
-        "kalendarz wydarzeń | tanie treningi strzelectwa dynamicznego",
+    return parse_polish_date_from_text(m.group(1))
+
+
+def format_event_date(d: date):
+    months = {
+        1: "sty",
+        2: "lut",
+        3: "mar",
+        4: "kwi",
+        5: "maj",
+        6: "cze",
+        7: "lip",
+        8: "sie",
+        9: "wrz",
+        10: "paź",
+        11: "lis",
+        12: "gru",
     }
 
-    def flush_event():
-        nonlocal current_title, current_time, current_availability, current_is_full
+    return f"{months[d.month]} {d.day}, {d.year}"
 
-        if (
-            current_date
-            and current_title
-            and current_time
-            and current_availability
-            and not current_is_full
-        ):
-            found.append(
-                f"{current_date} | {current_time} | {current_title} | {current_availability}"
-            )
 
-        current_title = None
-        current_time = None
-        current_availability = None
-        current_is_full = False
+def clean_title(line: str):
+    line = normalize_text(line)
 
-    for line in lines:
-        lower = line.lower()
+    junk = [
+        "Szczegóły",
+        "Rezerwuj",
+        "Pełne obłożenie",
+        "Obsługiwane przez",
+        "Copyright",
+    ]
 
-        if date_regex.match(line):
-            flush_event()
-            current_date = line
+    for item in junk:
+        line = line.replace(item, "")
+
+    return normalize_text(line)
+
+
+def is_probably_title(line: str):
+    line = normalize_text(line)
+
+    if not line:
+        return False
+
+    lowered = line.lower()
+
+    bad_fragments = [
+        "reservio",
+        "obsługiwane przez",
+        "copyright",
+        "pełne obłożenie",
+        "brak wydarzeń",
+        "pokaż nadchodzące",
+        "w tym dniu",
+        "szczegóły",
+        "rezerwuj",
+        "zarezerwuj",
+    ]
+
+    if any(x in lowered for x in bad_fragments):
+        return False
+
+    if AVAILABILITY_RE.search(line):
+        return False
+
+    if TIME_RE.search(line):
+        return False
+
+    if parse_polish_date_from_text(line):
+        return False
+
+    return len(line) >= 3
+
+
+def extract_available_events_from_text(page_text: str, fallback_date=None):
+    text = normalize_text(page_text)
+    lines = [normalize_text(x) for x in text.splitlines()]
+    lines = [x for x in lines if x]
+
+    events = []
+    current_date = fallback_date
+
+    for i, line in enumerate(lines):
+        found_date = parse_polish_date_from_text(line)
+
+        if found_date:
+            current_date = found_date
+
+        time_match = TIME_RE.search(line)
+
+        if not time_match:
             continue
 
-        if "w tym dniu nie ma żadnych wydarzeń" in lower:
-            flush_event()
+        block_lines = lines[i:i + 8]
+        block_text = " | ".join(block_lines)
+
+        if FULL_RE.search(block_text):
             continue
 
-        if lower in noise:
+        availability_match = AVAILABILITY_RE.search(block_text)
+
+        if not availability_match:
             continue
 
-        if lower.startswith("© copyright"):
-            continue
+        event_date = current_date or fallback_date
 
-        if "masz własny biznes" in lower:
-            continue
+        title = None
+        for candidate in lines[i + 1:i + 5]:
+            if is_probably_title(candidate):
+                title = clean_title(candidate)
+                break
 
-        if lower in ["pon.", "wt.", "śr.", "czw.", "pt.", "sob.", "niedz."]:
-            continue
+        if not title:
+            title = "Wydarzenie"
 
-        if re.fullmatch(r"\d+", line):
-            continue
+        count = int(availability_match.group("count"))
+        availability_label = availability_match.group(0).strip()
 
-        if re.fullmatch(r"\d+\s*zł", line, re.IGNORECASE):
-            continue
+        events.append(
+            {
+                "date": event_date.isoformat() if event_date else None,
+                "date_display": format_event_date(event_date) if event_date else "data nieznana",
+                "time": normalize_text(time_match.group("time")),
+                "title": title,
+                "spots": count,
+                "availability": availability_label,
+            }
+        )
 
-        if "pełne obłożenie" in lower:
-            current_is_full = True
-            continue
+    return dedupe_events(events)
 
-        if time_regex.search(line):
-            current_time = line
-            continue
 
-        if availability_regex.search(line):
-            current_availability = line
-            continue
-
-        if current_date and not current_title:
-            current_title = line
-            continue
-
-    flush_event()
-
-    unique = []
+def dedupe_events(events):
     seen = set()
+    result = []
 
-    for event in found:
-        key = event.lower()
+    for event in events:
+        key = (
+            event.get("date"),
+            event.get("time"),
+            event.get("title"),
+            event.get("availability"),
+        )
 
-        if key not in seen:
-            seen.add(key)
-            unique.append(event)
+        if key in seen:
+            continue
 
-    return unique
+        seen.add(key)
+        result.append(event)
+
+    return result
 
 
-def scan_ttsd():
+def event_in_horizon(event, today, horizon):
+    raw_date = event.get("date")
+
+    if not raw_date:
+        # Lepiej zgłosić niż przegapić termin, ale w wiadomości będzie "data nieznana".
+        return True
+
+    try:
+        d = date.fromisoformat(raw_date)
+    except ValueError:
+        return True
+
+    return today <= d <= horizon
+
+
+def click_if_visible(page, selectors, label):
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+
+            if locator.count() == 0:
+                continue
+
+            first = locator.first
+
+            if first.is_visible(timeout=1500):
+                first.click(timeout=5000)
+                print(f"Kliknięto: {label} przez selector: {selector}", flush=True)
+                page.wait_for_timeout(5000)
+                return True
+
+        except Exception as e:
+            print(f"Nie kliknięto {label} przez {selector}: {e}", flush=True)
+
+    return False
+
+
+def click_show_upcoming(page):
+    selectors = [
+        "text=/POKAŻ NADCHODZĄCE WYDARZENIA/i",
+        "text=/Pokaż nadchodzące wydarzenia/i",
+        "text=/nadchodzące wydarzenia/i",
+        "button:has-text('POKAŻ NADCHODZĄCE WYDARZENIA')",
+        "button:has-text('Pokaż nadchodzące wydarzenia')",
+        "a:has-text('POKAŻ NADCHODZĄCE WYDARZENIA')",
+        "a:has-text('Pokaż nadchodzące wydarzenia')",
+    ]
+
+    return click_if_visible(page, selectors, "POKAŻ NADCHODZĄCE WYDARZENIA")
+
+
+def click_next_period(page):
+    selectors = [
+        "button[aria-label*='Następny']",
+        "button[aria-label*='następny']",
+        "button[aria-label*='Next']",
+        "a[aria-label*='Następny']",
+        "a[aria-label*='następny']",
+        "a[aria-label*='Next']",
+
+        "button:has-text('Następny')",
+        "a:has-text('Następny')",
+        "button:has-text('Dalej')",
+        "a:has-text('Dalej')",
+
+        "[data-testid*='next']",
+        "[class*='next'] button",
+        "[class*='Next'] button",
+    ]
+
+    return click_if_visible(page, selectors, "następny okres")
+
+
+def get_visible_page_text(page):
+    try:
+        return page.inner_text("body", timeout=15000)
+    except Exception:
+        return ""
+
+
+def scan_reservio_once():
+    today = datetime.now().date()
+    horizon = add_months(today, SCAN_MONTHS_AHEAD)
+
+    all_events = []
+    all_texts = []
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=["--no-sandbox"],
         )
 
-        page = browser.new_page(
-            viewport={
-                "width": 1400,
-                "height": 1800,
-            },
-            user_agent="Mozilla/5.0",
+        context = browser.new_context(
+            locale="pl-PL",
+            timezone_id="Europe/Warsaw",
+            viewport={"width": 1440, "height": 1600},
         )
 
-        print(f"Otwieram stronę: {URL}", flush=True)
+        page = context.new_page()
+
+        print(f"Wchodzę na: {URL}", flush=True)
+        print(f"Skanuję od {today.isoformat()} do {horizon.isoformat()}", flush=True)
 
         page.goto(
             URL,
-            wait_until="domcontentloaded",
+            wait_until="commit",
             timeout=60000,
         )
 
         page.wait_for_timeout(8000)
 
-        start_text = normalize_text(page.locator("body").inner_text(timeout=20000))
-        fallback_date = get_next_event_date_hint(start_text)
+        first_text = get_visible_page_text(page)
+        all_texts.append(first_text)
 
-        print("========== TEKST STARTOWY ==========", flush=True)
-        print(start_text[:2500], flush=True)
-        print("========== KONIEC TEKSTU STARTOWEGO ==========", flush=True)
+        fallback_date = parse_next_event_fallback_date(first_text)
 
         if fallback_date:
-            print(f"Data z komunikatu strony: {fallback_date}", flush=True)
+            print(f"Fallback data z komunikatu: {fallback_date.isoformat()}", flush=True)
 
-        load_events(page)
+        click_show_upcoming(page)
 
-        page.wait_for_timeout(3000)
+        # Pierwszy odczyt po kliknięciu "pokaż nadchodzące"
+        text = get_visible_page_text(page)
+        all_texts.append(text)
 
-        print("Wyciągam pojedyncze wydarzenia z DOM...", flush=True)
-        events = extract_events_from_dom(page, fallback_date)
+        found = extract_available_events_from_text(
+            text,
+            fallback_date=fallback_date,
+        )
+        all_events.extend(found)
 
-        if not events:
-            print("DOM nic nie znalazł. Uruchamiam fallback tekstowy...", flush=True)
-            events = extract_events_from_text_fallback(page, fallback_date)
+        # Najważniejsze: przechodzimy kolejne widoki do 3 miesięcy do przodu.
+        # Limit 16 jest celowo większy niż 3 miesiące, bo Reservio może mieć widoki tygodniowe.
+        for step in range(16):
+            if not click_next_period(page):
+                print("Brak przycisku następnego okresu albo nie dało się kliknąć.", flush=True)
+                break
 
-        unique = []
-        seen = set()
+            text = get_visible_page_text(page)
+            all_texts.append(text)
 
-        for event in events:
-            key = event.lower()
+            fallback_date = parse_next_event_fallback_date(text) or fallback_date
 
-            if key not in seen:
-                seen.add(key)
-                unique.append(event)
+            found = extract_available_events_from_text(
+                text,
+                fallback_date=fallback_date,
+            )
 
-        if unique:
-            for event in unique:
-                print(f"Znaleziono: {event}", flush=True)
-        else:
-            print("Brak wolnych miejsc.", flush=True)
+            all_events.extend(found)
 
+            dated_events = [
+                e for e in all_events
+                if e.get("date")
+            ]
+
+            if dated_events:
+                max_seen_date = max(date.fromisoformat(e["date"]) for e in dated_events)
+                print(f"Najdalsza znaleziona data: {max_seen_date.isoformat()}", flush=True)
+
+                if max_seen_date >= horizon:
+                    print("Osiągnięto horyzont 3 miesięcy.", flush=True)
+                    break
+
+        context.close()
         browser.close()
 
-        return unique
+    all_events = dedupe_events(all_events)
+
+    in_horizon = [
+        e for e in all_events
+        if event_in_horizon(e, today, horizon)
+    ]
+
+    in_horizon.sort(
+        key=lambda e: (
+            e.get("date") or "9999-99-99",
+            e.get("time") or "",
+            e.get("title") or "",
+        )
+    )
+
+    print(f"Wszystkie wykryte wolne eventy: {len(all_events)}", flush=True)
+    print(f"Wolne eventy w horyzoncie {SCAN_MONTHS_AHEAD} mies.: {len(in_horizon)}", flush=True)
+
+    return in_horizon, today, horizon
 
 
-notify("✅ TTSD monitor uruchomiony.")
-print("Start TTSD monitora.", flush=True)
+def build_message(events, today, horizon):
+    if not events:
+        return None
 
-while True:
-    try:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{now}] Sprawdzam TTSD...", flush=True)
+    lines = [
+        f"🚨 Reservio: wykryto wolne miejsca!",
+        "",
+        f"Zakres skanowania: {today.isoformat()} → {horizon.isoformat()}",
+        "",
+    ]
 
-        events = scan_ttsd()
+    for event in events:
+        lines.append(
+            f"• {event['date_display']} | "
+            f"{event['time']} | "
+            f"{event['title']} | "
+            f"{event['availability']}"
+        )
 
-        if events:
-            current_alert = "\n".join(f"• {event}" for event in events)
+    lines.extend(
+        [
+            "",
+            URL,
+        ]
+    )
 
-            print("Dostępne: True", flush=True)
-            print(current_alert, flush=True)
+    return "\n".join(lines)
 
-            if current_alert != last_alert:
-                notify(
-                    "🚨 TTSD: wykryto wolne miejsca!\n\n"
-                    f"{current_alert}\n\n"
-                    f"{URL}"
-                )
 
-                last_alert = current_alert
+def main():
+    notify(
+        "✅ Reservio monitor uruchomiony.\n"
+        f"Skanuję terminy do {SCAN_MONTHS_AHEAD} miesięcy do przodu.\n"
+        f"{URL}"
+    )
+
+    last_state = load_last_state()
+
+    while True:
+        try:
+            print("=" * 60, flush=True)
+            print("Start sprawdzania Reservio...", flush=True)
+
+            events, today, horizon = scan_reservio_once()
+            message = build_message(events, today, horizon)
+
+            current_hash = state_hash(events)
+
+            if events:
+                if last_state.get("hash") != current_hash:
+                    notify(message)
+                    last_state = {
+                        "hash": current_hash,
+                        "last_sent_at": datetime.now().isoformat(timespec="seconds"),
+                        "events_count": len(events),
+                    }
+                    save_last_state(last_state)
+                    print("Wysłano nowy alert Telegram.", flush=True)
+                else:
+                    print("Wolne miejsca nadal są takie same — nie wysyłam duplikatu.", flush=True)
             else:
-                print("Te same miejsca już były zgłoszone — nie wysyłam ponownie.", flush=True)
+                print("Brak wolnych miejsc w zakresie 3 miesięcy.", flush=True)
 
-        else:
-            print("Dostępne: False", flush=True)
-            last_alert = None
+                # Resetujemy hash, żeby gdy miejsca znikną i pojawią się ponownie,
+                # bot wysłał nowy alert.
+                if last_state.get("hash"):
+                    last_state = {}
+                    save_last_state(last_state)
 
-        print("Sprawdzono TTSD.", flush=True)
+            print("Koniec sprawdzania.", flush=True)
 
-    except Exception as e:
-        print(f"Błąd TTSD: {e}", flush=True)
+        except Exception as e:
+            print(f"Błąd głównej pętli: {e}", flush=True)
 
-    time.sleep(CHECK_EVERY_SECONDS)
+        time.sleep(CHECK_EVERY_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
