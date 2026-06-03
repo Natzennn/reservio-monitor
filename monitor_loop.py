@@ -74,12 +74,6 @@ def normalize_text(text):
 
 
 def parse_polish_date(line):
-    """
-    Obsługuje np.:
-    Sobota, cze 13, 2026
-    Środa, cze 03, 2026
-    """
-
     pattern = re.compile(
         r"^(?:poniedziałek|wtorek|środa|czwartek|piątek|sobota|niedziela),\s+"
         r"([a-ząćęłńóśźż]+)\s+(\d{1,2}),\s+(\d{4})$",
@@ -116,44 +110,59 @@ def has_free_places(text):
 
 
 def click_show_upcoming(page):
-    """
-    Klika 'POKAŻ NADCHODZĄCE WYDARZENIA'.
-    Używa współrzędnych, podobnie jak Twój działający monitor Veloart.
-    """
-
     print("Szukam przycisku: POKAŻ NADCHODZĄCE WYDARZENIA", flush=True)
 
-    try:
-        button = page.get_by_text("POKAŻ NADCHODZĄCE WYDARZENIA", exact=False).first()
+    selectors = [
+        'text="POKAŻ NADCHODZĄCE WYDARZENIA"',
+        'button:has-text("POKAŻ NADCHODZĄCE WYDARZENIA")',
+        'a:has-text("POKAŻ NADCHODZĄCE WYDARZENIA")',
+        'div:has-text("POKAŻ NADCHODZĄCE WYDARZENIA")',
+        'span:has-text("POKAŻ NADCHODZĄCE WYDARZENIA")',
+    ]
 
-        if button.count() > 0 and button.is_visible():
-            box = button.bounding_box(timeout=10000)
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
 
-            if box:
-                page.mouse.click(
-                    box["x"] + box["width"] / 2,
-                    box["y"] + box["height"] / 2,
-                )
+            if locator.count() > 0 and locator.is_visible():
+                print(f"Znaleziono przycisk przez selector: {selector}", flush=True)
+
+                try:
+                    locator.scroll_into_view_if_needed(timeout=5000)
+                except Exception:
+                    pass
+
+                try:
+                    locator.click(timeout=10000, force=True)
+                except Exception:
+                    locator.evaluate(
+                        """el => {
+                            const clickable = el.closest('button, a') || el;
+                            clickable.click();
+                        }"""
+                    )
 
                 print("Kliknięto: POKAŻ NADCHODZĄCE WYDARZENIA", flush=True)
+
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass
+
                 page.wait_for_timeout(WAIT_MS)
                 return True
 
-    except Exception as e:
-        print(f"Nie udało się kliknąć POKAŻ NADCHODZĄCE WYDARZENIA: {e}", flush=True)
+        except Exception as e:
+            print(f"Nie udało się kliknąć przez selector {selector}: {e}", flush=True)
 
     print("Nie znaleziono przycisku POKAŻ NADCHODZĄCE WYDARZENIA.", flush=True)
     return False
 
 
 def click_next_week(page):
-    """
-    Klika prawą strzałkę w .calendar-nav.
-    To jest podejście podobne do Twojego click_previous_month z Veloart.
-    """
-
     try:
-        nav = page.locator(".calendar-nav").bounding_box(timeout=10000)
+        page.wait_for_selector(".calendar-nav", timeout=10000)
+        nav = page.locator(".calendar-nav").bounding_box()
 
         if not nav:
             raise Exception("Nie znaleziono .calendar-nav")
@@ -170,7 +179,6 @@ def click_next_week(page):
     except Exception as e:
         print(f"Nie udało się kliknąć następnego tygodnia przez .calendar-nav: {e}", flush=True)
 
-    # Fallback na typowe przyciski
     selectors = [
         'button[aria-label*="Next"]',
         'button[aria-label*="Następ"]',
@@ -182,7 +190,7 @@ def click_next_week(page):
 
     for selector in selectors:
         try:
-            locator = page.locator(selector).first()
+            locator = page.locator(selector).first
 
             if locator.count() > 0 and locator.is_visible():
                 locator.click(timeout=10000, force=True)
@@ -198,16 +206,6 @@ def click_next_week(page):
 
 
 def parse_visible_events(full_text):
-    """
-    Parser pod widok TTSD:
-
-    Sobota, cze 13, 2026
-    Pistolet w samoobronie (CCW) [FSO]
-    10:00 - 12:00 • 2 wolne miejsca • Dominik
-    120 zł
-    ZAREZERWUJ
-    """
-
     full_text = normalize_text(full_text)
     lines = [line.strip() for line in full_text.splitlines() if line.strip()]
 
