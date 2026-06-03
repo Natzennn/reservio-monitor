@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 
 URL = "https://test1874.reservio.com/events"
-CHECK_EVERY_SECONDS = 180
+CHECK_EVERY_SECONDS = 180  # Sprawdzanie co 3 minuty
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -37,13 +37,21 @@ def notify(text):
         print(f"Błąd Telegram: {e}", flush=True)
 
 
+def test_notification():
+    """Tymczasowy test wysyłania alertu Telegram."""
+    notify(
+        "🚨 TEST Reservio: wykryto dostępne miejsce!\n\n"
+        "Przykładowe szkolenie | 10 czerwca 2026 | 12:00 | 1 miejsce dostępne\n\n"
+        f"{URL}"
+    )
+
+
 def get_page_text():
     """Pobiera tekst strony po wyrenderowaniu JS przez Playwright."""
     last_error = None
 
     for attempt in range(3):
         browser = None
-
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(
@@ -83,14 +91,12 @@ def get_page_text():
 
 def parse_available_events(full_text):
     """
-    Wykrywa dostępne miejsca i próbuje zwrócić sensowny opis wydarzeń.
-
-    Szuka fraz:
+    Wykrywa dostępne miejsca i zwraca sensowny opis wydarzeń.
+    Szuka fraz typu:
     - 1 miejsce dostępne
     - 2 miejsca dostępne
     - 5 miejsc dostępnych
     """
-
     lines = [line.strip() for line in full_text.splitlines() if line.strip()]
 
     found_events = []
@@ -116,7 +122,6 @@ def parse_available_events(full_text):
 
     for event in found_events:
         normalized = event.lower()
-
         if normalized not in seen:
             seen.add(normalized)
             unique_events.append(event)
@@ -128,6 +133,8 @@ def main():
     global last_found_details
 
     notify("✅ Reservio monitor uruchomiony.")
+    # Tymczasowy test powiadomienia
+    test_notification()
 
     while True:
         try:
@@ -148,7 +155,6 @@ def main():
                         f"{current_details}\n\n"
                         f"{URL}"
                     )
-
                     notify(message)
                     last_found_details = current_details
                 else:
