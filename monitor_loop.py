@@ -15,6 +15,22 @@ CHAT_ID = os.environ["CHAT_ID"]
 
 last_alert = None
 
+MONTHS_PL = {
+    "stycznia": "sty",
+    "lutego": "lut",
+    "marca": "mar",
+    "kwietnia": "kwi",
+    "maja": "maj",
+    "czerwca": "cze",
+    "lipca": "lip",
+    "sierpnia": "sie",
+    "września": "wrz",
+    "października": "paź",
+    "pazdziernika": "paź",
+    "listopada": "lis",
+    "grudnia": "gru",
+}
+
 
 def notify(text):
     try:
@@ -74,14 +90,41 @@ def click_button_if_exists(page, text):
     return False
 
 
+def get_next_event_date_hint(text):
+    """
+    Z komunikatu:
+    Następne wydarzenie odbędzie się czerwca 13, 2026
+    robi:
+    cze 13, 2026
+    """
+
+    text = normalize_text(text)
+
+    match = re.search(
+        r"Następne wydarzenie odbędzie się\s+([a-ząćęłńóśźż]+)\s+(\d{1,2}),\s+(\d{4})",
+        text,
+        re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    month_long = match.group(1).lower()
+    day = match.group(2)
+    year = match.group(3)
+
+    month_short = MONTHS_PL.get(month_long, month_long)
+
+    return f"{month_short} {day}, {year}"
+
+
 def load_events(page):
     body_text = normalize_text(page.locator("body").inner_text(timeout=20000))
 
     if "POKAŻ NADCHODZĄCE WYDARZENIA" in body_text:
         click_button_if_exists(page, "POKAŻ NADCHODZĄCE WYDARZENIA")
 
-    # Próbujemy doczytać dalsze wydarzenia, jeśli pojawi się taki przycisk.
-    for _ in range(10):
+    for _ in range(5):
         page.wait_for_timeout(1500)
 
         try:
@@ -93,21 +136,17 @@ def load_events(page):
         body_text = normalize_text(page.locator("body").inner_text(timeout=20000))
 
         if "POKAŻ WSZYSTKIE WYDARZENIA" in body_text:
-            clicked = click_button_if_exists(page, "POKAŻ WSZYSTKIE WYDARZENIA")
-            if not clicked:
-                break
-            continue
+            if click_button_if_exists(page, "POKAŻ WSZYSTKIE WYDARZENIA"):
+                continue
 
         if "POKAŻ WIĘCEJ" in body_text:
-            clicked = click_button_if_exists(page, "POKAŻ WIĘCEJ")
-            if not clicked:
-                break
-            continue
+            if click_button_if_exists(page, "POKAŻ WIĘCEJ"):
+                continue
 
         break
 
 
-def extract_events_from_dom(page):
+def extract_events_from_dom(page, fallback_date):
     events = page.evaluate(
         """
         () => {
@@ -173,41 +212,6 @@ def extract_events_from_dom(page):
                 return noise.some(x => lower.includes(x));
             }
 
-            function visibleLines(el) {
-                return clean(el.innerText)
-                    .split("\\n")
-                    .map(clean)
-                    .filter(Boolean);
-            }
-
-            function findDateForRow(row) {
-                const rowTop = row.getBoundingClientRect().top + window.scrollY;
-
-                const dateNodes = Array.from(document.querySelectorAll("h1,h2,h3,h4,div,span"))
-                    .filter(isVisible)
-                    .map(el => {
-                        const text = clean(el.innerText);
-                        const lines = text.split("\\n").map(clean).filter(Boolean);
-
-                        if (lines.length !== 1) return null;
-                        if (!dateRegex.test(lines[0])) return null;
-
-                        return {
-                            text: lines[0],
-                            top: el.getBoundingClientRect().top + window.scrollY
-                        };
-                    })
-                    .filter(Boolean)
-                    .filter(item => item.top <= rowTop + 5)
-                    .sort((a, b) => b.top - a.top);
-
-                if (dateNodes.length > 0) {
-                    return dateNodes[0].text;
-                }
-
-                return "Data nieznana";
-            }
-
             function findBestEventRow(startEl) {
                 let el = startEl;
 
@@ -229,6 +233,34 @@ def extract_events_from_dom(page):
                 return null;
             }
 
+            function findDateForRow(row) {
+                const rowTop = row.getBoundingClientRect().top + window.scrollY;
+
+                const candidates = Array.from(document.querySelectorAll("h1,h2,h3,h4,div,span"))
+                    .filter(isVisible)
+                    .map(el => {
+                        const text = clean(el.innerText);
+                        const lines = text.split("\\n").map(clean).filter(Boolean);
+
+                        if (lines.length !== 1) return null;
+                        if (!dateRegex.test(lines[0])) return null;
+
+                        return {
+                            text: lines[0],
+                            top: el.getBoundingClientRect().top + window.scrollY
+                        };
+                    })
+                    .filter(Boolean)
+                    .filter(item => item.top <= rowTop + 10)
+                    .sort((a, b) => b.top - a.top);
+
+                if (candidates.length > 0) {
+                    return candidates[0].text;
+                }
+
+                return "";
+            }
+
             const allVisible = Array.from(document.querySelectorAll("body *")).filter(isVisible);
 
             const availabilityNodes = allVisible.filter(el => {
@@ -243,7 +275,6 @@ def extract_events_from_dom(page):
 
             for (const node of availabilityNodes) {
                 const row = findBestEventRow(node);
-
                 if (!row) continue;
 
                 if (!rows.includes(row)) {
@@ -304,20 +335,19 @@ def extract_events_from_dom(page):
     clean_events = []
 
     for event in events:
-        date_text = normalize_text(event.get("date", "Data nieznana"))
+        date_text = normalize_text(event.get("date", ""))
+
+        if not date_text:
+            if fallback_date:
+                date_text = fallback_date
+            else:
+                date_text = "Data nieznana"
+
         time_text = normalize_text(event.get("time", "Godzina nieznana"))
         title_text = normalize_text(event.get("title", "Wydarzenie nieznane"))
         availability_text = normalize_text(event.get("availability", ""))
 
         if not availability_text:
-            continue
-
-        # Nie wysyłamy śmieci bez daty, żeby uniknąć fałszywych alertów.
-        if date_text == "Data nieznana":
-            print(
-                f"Pominięto event bez daty: {time_text} | {title_text} | {availability_text}",
-                flush=True,
-            )
             continue
 
         clean_events.append(
@@ -327,13 +357,7 @@ def extract_events_from_dom(page):
     return clean_events
 
 
-def extract_events_from_text_fallback(page):
-    """
-    Awaryjny parser tekstowy.
-    Używany tylko, jeśli parser DOM nic nie znalazł.
-    Idzie linia po linii i nie miesza pełnych wydarzeń z wolnymi.
-    """
-
+def extract_events_from_text_fallback(page, fallback_date):
     text = normalize_text(page.locator("body").inner_text(timeout=20000))
 
     lines = [
@@ -361,6 +385,14 @@ def extract_events_from_text_fallback(page):
         re.IGNORECASE,
     )
 
+    found = []
+
+    current_date = fallback_date or None
+    current_title = None
+    current_time = None
+    current_availability = None
+    current_is_full = False
+
     noise = {
         "tanie treningi strzelectwa dynamicznego",
         "przemysław",
@@ -375,14 +407,6 @@ def extract_events_from_text_fallback(page):
         "reservio business",
         "kalendarz wydarzeń | tanie treningi strzelectwa dynamicznego",
     }
-
-    found = []
-
-    current_date = None
-    current_title = None
-    current_time = None
-    current_availability = None
-    current_is_full = False
 
     def flush_event():
         nonlocal current_title, current_time, current_availability, current_is_full
@@ -489,22 +513,26 @@ def scan_ttsd():
 
         page.wait_for_timeout(8000)
 
-        body_text = normalize_text(page.locator("body").inner_text(timeout=20000))
+        start_text = normalize_text(page.locator("body").inner_text(timeout=20000))
+        fallback_date = get_next_event_date_hint(start_text)
 
         print("========== TEKST STARTOWY ==========", flush=True)
-        print(body_text[:2500], flush=True)
+        print(start_text[:2500], flush=True)
         print("========== KONIEC TEKSTU STARTOWEGO ==========", flush=True)
+
+        if fallback_date:
+            print(f"Data z komunikatu strony: {fallback_date}", flush=True)
 
         load_events(page)
 
         page.wait_for_timeout(3000)
 
         print("Wyciągam pojedyncze wydarzenia z DOM...", flush=True)
-        events = extract_events_from_dom(page)
+        events = extract_events_from_dom(page, fallback_date)
 
         if not events:
             print("DOM nic nie znalazł. Uruchamiam fallback tekstowy...", flush=True)
-            events = extract_events_from_text_fallback(page)
+            events = extract_events_from_text_fallback(page, fallback_date)
 
         unique = []
         seen = set()
