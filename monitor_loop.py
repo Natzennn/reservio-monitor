@@ -3,7 +3,7 @@ import requests
 import os
 import time
 import re
-from datetime import datetime, date, timedelta
+from datetime import datetime
 
 URL = "https://ttsd.reservio.com/events"
 
@@ -14,35 +14,6 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
 last_alert = None
-
-
-POLISH_MONTHS = {
-    "sty": 1,
-    "stycznia": 1,
-    "lut": 2,
-    "lutego": 2,
-    "mar": 3,
-    "marca": 3,
-    "kwi": 4,
-    "kwietnia": 4,
-    "maj": 5,
-    "maja": 5,
-    "cze": 6,
-    "czerwca": 6,
-    "lip": 7,
-    "lipca": 7,
-    "sie": 8,
-    "sierpnia": 8,
-    "wrz": 9,
-    "września": 9,
-    "paź": 10,
-    "paz": 10,
-    "października": 10,
-    "lis": 11,
-    "listopada": 11,
-    "gru": 12,
-    "grudnia": 12,
-}
 
 
 def notify(text):
@@ -69,10 +40,11 @@ def normalize_text(text):
         .replace("\u202f", " ")
         .replace("\u2009", " ")
         .replace("\u200b", "")
+        .strip()
     )
 
 
-def has_free_places(text):
+def has_available_places(text):
     text = normalize_text(text).lower()
 
     return bool(
@@ -85,6 +57,46 @@ def has_free_places(text):
             re.IGNORECASE,
         )
     )
+
+
+def is_time_line(text):
+    return bool(
+        re.search(
+            r"\b\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}\b",
+            text,
+        )
+    )
+
+
+def is_available_line(text):
+    return has_available_places(text)
+
+
+def is_noise_line(text):
+    lower = normalize_text(text).lower()
+
+    noise_phrases = [
+        "tanie treningi strzelectwa dynamicznego",
+        "zaloguj się",
+        "strona główna",
+        "wydarzenia",
+        "obsługiwane przez",
+        "copyright",
+        "wszelkie prawa zastrzeżone",
+        "masz własny biznes",
+        "wypróbuj reservio",
+        "kalendarz wydarzeń",
+        "przejrzyj wydarzenia",
+        "szczegóły",
+        "pełne obłożenie",
+        "brak wydarzeń",
+        "pokaż nadchodzące wydarzenia",
+    ]
+
+    if lower in ["/", ""]:
+        return True
+
+    return any(phrase in lower for phrase in noise_phrases)
 
 
 def click_show_upcoming(page):
@@ -102,7 +114,12 @@ def click_show_upcoming(page):
 
             if locator.count() > 0 and locator.is_visible():
                 print(f"Znaleziono przycisk przez selector: {selector}", flush=True)
-                locator.scroll_into_view_if_needed(timeout=5000)
+
+                try:
+                    locator.scroll_into_view_if_needed(timeout=5000)
+                except Exception:
+                    pass
+
                 locator.click(timeout=10000, force=True)
 
                 print("Kliknięto: POKAŻ NADCHODZĄCE WYDARZENIA", flush=True)
@@ -116,46 +133,110 @@ def click_show_upcoming(page):
     return False
 
 
+def clean_event_text(raw_lines):
+    clean_lines = []
+
+    for line in raw_lines:
+        line = normalize_text(line)
+
+        if not line:
+            continue
+
+        if is_noise_line(line):
+            continue
+
+        clean_lines.append(line)
+
+    return clean_lines
+
+
 def parse_events_from_text(full_text):
     """
-    Parser dopasowany do TTSD po kliknięciu:
-    widzi np.
+    Parser pod TTSD.
+
+    Z tekstu typu:
+    Szczegóły
     10:00 - 12:00
     Pistolet w samoobronie (CCW) [FSO]
     2 miejsc dostępnych
+
+    robi:
+    10:00 - 12:00 | Pistolet w samoobronie (CCW) [FSO] | 2 miejsc dostępnych
     """
 
     full_text = normalize_text(full_text)
-    lines = [line.strip() for line in full_text.splitlines() if line.strip()]
+    lines = [normalize_text(line) for line in full_text.splitlines() if normalize_text(line)]
 
     found = []
 
     for idx, line in enumerate(lines):
-        if has_free_places(line):
-            start = max(0, idx - 8)
-            end = min(len(lines), idx + 8)
+        if not is_available_line(line):
+            continue
 
-            block = lines[start:end]
-            block_text = " | ".join(block)
-            block_lower = block_text.lower()
+        availability = line
 
-            if "pełne obłożenie" in block_lower:
-                # czasami "pełne obłożenie" dotyczy poprzedniego eventu,
-                # więc nie odrzucamy od razu całego wyniku;
-                # bierzemy mniejszy kontekst wokół dostępności
-                start = max(0, idx - 4)
-                end = min(len(lines), idx + 4)
-                block = lines[start:end]
-                block_text = " | ".join(block)
-                block_lower = block_text.lower()
+        time_line = None
+        title_line = None
 
-            found.append(block_text)
+        # Szukamy godziny najbliżej przed linią z dostępnością
+        for j in range(idx - 1, max(-1, idx - 8), -1):
+            candidate = lines[j]
+
+            if is_time_line(candidate):
+                time_line = candidate
+                break
+
+        # Szukamy tytułu między godziną a dostępnością
+        if time_line:
+            time_index = lines.index(time_line)
+
+            for j in range(time_index + 1, idx):
+                candidate = lines[j]
+
+                if is_noise_line(candidate):
+                    continue
+
+                if is_time_line(candidate):
+                    continue
+
+                if is_available_line(candidate):
+                    continue
+
+                title_line = candidate
+                break
+
+        # Fallback, gdyby nie udało się znaleźć tytułu po godzinie
+        if not title_line:
+            for j in range(idx - 1, max(-1, idx - 8), -1):
+                candidate = lines[j]
+
+                if is_noise_line(candidate):
+                    continue
+
+                if is_time_line(candidate):
+                    continue
+
+                if is_available_line(candidate):
+                    continue
+
+                title_line = candidate
+                break
+
+        if not time_line:
+            time_line = "Godzina nieznana"
+
+        if not title_line:
+            title_line = "Wydarzenie nieznane"
+
+        event_text = f"{time_line} | {title_line} | {availability}"
+        found.append(event_text)
 
     unique = []
     seen = set()
 
     for item in found:
         key = item.lower()
+
         if key not in seen:
             seen.add(key)
             unique.append(item)
@@ -193,7 +274,7 @@ def scan_ttsd():
         body_text = normalize_text(page.locator("body").inner_text(timeout=20000))
 
         print("========== TEKST STARTOWY ==========", flush=True)
-        print(body_text[:2500], flush=True)
+        print(body_text[:2000], flush=True)
         print("========== KONIEC TEKSTU STARTOWEGO ==========", flush=True)
 
         if "POKAŻ NADCHODZĄCE WYDARZENIA" in body_text:
@@ -232,7 +313,7 @@ while True:
         events = scan_ttsd()
 
         if events:
-            current_alert = "\n\n".join(events)
+            current_alert = "\n".join(f"• {event}" for event in events)
 
             print("Dostępne: True", flush=True)
             print(current_alert, flush=True)
