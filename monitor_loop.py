@@ -44,61 +44,6 @@ def normalize_text(text):
     )
 
 
-def has_available_places(text):
-    text = normalize_text(text).lower()
-
-    return bool(
-        re.search(
-            r"\b\d+\s*(?:"
-            r"wolne miejsce|wolne miejsca|wolnych miejsc|"
-            r"miejsce dostępne|miejsca dostępne|miejsc dostępnych"
-            r")\b",
-            text,
-            re.IGNORECASE,
-        )
-    )
-
-
-def is_time_line(text):
-    return bool(
-        re.search(
-            r"\b\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}\b",
-            text,
-        )
-    )
-
-
-def is_available_line(text):
-    return has_available_places(text)
-
-
-def is_noise_line(text):
-    lower = normalize_text(text).lower()
-
-    noise_phrases = [
-        "tanie treningi strzelectwa dynamicznego",
-        "zaloguj się",
-        "strona główna",
-        "wydarzenia",
-        "obsługiwane przez",
-        "copyright",
-        "wszelkie prawa zastrzeżone",
-        "masz własny biznes",
-        "wypróbuj reservio",
-        "kalendarz wydarzeń",
-        "przejrzyj wydarzenia",
-        "szczegóły",
-        "pełne obłożenie",
-        "brak wydarzeń",
-        "pokaż nadchodzące wydarzenia",
-    ]
-
-    if lower in ["/", ""]:
-        return True
-
-    return any(phrase in lower for phrase in noise_phrases)
-
-
 def click_show_upcoming(page):
     print("Szukam przycisku: POKAŻ NADCHODZĄCE WYDARZENIA", flush=True)
 
@@ -133,115 +78,152 @@ def click_show_upcoming(page):
     return False
 
 
-def clean_event_text(raw_lines):
-    clean_lines = []
-
-    for line in raw_lines:
-        line = normalize_text(line)
-
-        if not line:
-            continue
-
-        if is_noise_line(line):
-            continue
-
-        clean_lines.append(line)
-
-    return clean_lines
-
-
-def parse_events_from_text(full_text):
+def extract_events_from_dom(page):
     """
-    Parser pod TTSD.
-
-    Z tekstu typu:
-    Szczegóły
-    10:00 - 12:00
-    Pistolet w samoobronie (CCW) [FSO]
-    2 miejsc dostępnych
-
-    robi:
-    10:00 - 12:00 | Pistolet w samoobronie (CCW) [FSO] | 2 miejsc dostępnych
+    Pobiera wydarzenia z DOM w kolejności widocznej na stronie.
+    Dzięki temu łapie też datę dnia, np.:
+    Sobota, cze 13, 2026
     """
 
-    full_text = normalize_text(full_text)
-    lines = [normalize_text(line) for line in full_text.splitlines() if normalize_text(line)]
+    events = page.evaluate(
+        """
+        () => {
+            const dateRegex = /^(Poniedziałek|Wtorek|Środa|Czwartek|Piątek|Sobota|Niedziela),\\s+(sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|paz|lis|gru)\\s+\\d{1,2},\\s+\\d{4}$/i;
 
-    found = []
+            const availabilityRegex = /\\b\\d+\\s*(wolne miejsce|wolne miejsca|wolnych miejsc|miejsce dostępne|miejsca dostępne|miejsc dostępnych)\\b/i;
 
-    for idx, line in enumerate(lines):
-        if not is_available_line(line):
+            const timeRegex = /\\b\\d{1,2}:\\d{2}\\s*-\\s*\\d{1,2}:\\d{2}\\b/;
+
+            function cleanText(text) {
+                return (text || "")
+                    .replace(/\\u00a0/g, " ")
+                    .replace(/\\u202f/g, " ")
+                    .replace(/\\u2009/g, " ")
+                    .replace(/\\u200b/g, "")
+                    .trim();
+            }
+
+            function isVisible(el) {
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+
+                return (
+                    style &&
+                    style.visibility !== "hidden" &&
+                    style.display !== "none" &&
+                    rect.width > 0 &&
+                    rect.height > 0
+                );
+            }
+
+            function isNoise(line) {
+                const lower = line.toLowerCase();
+
+                const noise = [
+                    "szczegóły",
+                    "pełne obłożenie",
+                    "zaloguj się",
+                    "strona główna",
+                    "wydarzenia",
+                    "obsługiwane przez",
+                    "copyright",
+                    "wszelkie prawa zastrzeżone",
+                    "masz własny biznes",
+                    "wypróbuj reservio",
+                    "pokaż nadchodzące wydarzenia"
+                ];
+
+                if (lower === "/" || lower === "") return true;
+
+                return noise.some(x => lower.includes(x));
+            }
+
+            const nodes = Array.from(document.querySelectorAll("h1, h2, h3, h4, li, div"));
+
+            let currentDate = "";
+            const found = [];
+
+            for (const node of nodes) {
+                if (!isVisible(node)) continue;
+
+                const text = cleanText(node.innerText);
+                if (!text) continue;
+
+                const lines = text
+                    .split("\\n")
+                    .map(cleanText)
+                    .filter(Boolean);
+
+                if (lines.length === 1 && dateRegex.test(lines[0])) {
+                    currentDate = lines[0];
+                    continue;
+                }
+
+                if (!availabilityRegex.test(text)) continue;
+
+                // Bierzemy tylko realne bloki eventów, nie wielki body/container.
+                if (lines.length > 20) continue;
+
+                const availabilityLine = lines.find(line => availabilityRegex.test(line)) || "";
+                const timeLine = lines.find(line => timeRegex.test(line)) || "Godzina nieznana";
+
+                let titleLine = "";
+
+                for (const line of lines) {
+                    if (isNoise(line)) continue;
+                    if (dateRegex.test(line)) continue;
+                    if (availabilityRegex.test(line)) continue;
+                    if (timeRegex.test(line)) continue;
+                    if (/^\\d+\\s*zł$/i.test(line)) continue;
+                    if (/^\\d+$/i.test(line)) continue;
+
+                    titleLine = line;
+                    break;
+                }
+
+                if (!titleLine) titleLine = "Wydarzenie nieznane";
+
+                found.push({
+                    date: currentDate || "Data nieznana",
+                    time: timeLine,
+                    title: titleLine,
+                    availability: availabilityLine
+                });
+            }
+
+            const unique = [];
+            const seen = new Set();
+
+            for (const event of found) {
+                const key = `${event.date}|${event.time}|${event.title}|${event.availability}`.toLowerCase();
+
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    unique.push(event);
+                }
+            }
+
+            return unique;
+        }
+        """
+    )
+
+    clean_events = []
+
+    for event in events:
+        date_text = normalize_text(event.get("date", "Data nieznana"))
+        time_text = normalize_text(event.get("time", "Godzina nieznana"))
+        title_text = normalize_text(event.get("title", "Wydarzenie nieznane"))
+        availability_text = normalize_text(event.get("availability", ""))
+
+        if not availability_text:
             continue
 
-        availability = line
+        clean_events.append(
+            f"{date_text} | {time_text} | {title_text} | {availability_text}"
+        )
 
-        time_line = None
-        title_line = None
-
-        # Szukamy godziny najbliżej przed linią z dostępnością
-        for j in range(idx - 1, max(-1, idx - 8), -1):
-            candidate = lines[j]
-
-            if is_time_line(candidate):
-                time_line = candidate
-                break
-
-        # Szukamy tytułu między godziną a dostępnością
-        if time_line:
-            time_index = lines.index(time_line)
-
-            for j in range(time_index + 1, idx):
-                candidate = lines[j]
-
-                if is_noise_line(candidate):
-                    continue
-
-                if is_time_line(candidate):
-                    continue
-
-                if is_available_line(candidate):
-                    continue
-
-                title_line = candidate
-                break
-
-        # Fallback, gdyby nie udało się znaleźć tytułu po godzinie
-        if not title_line:
-            for j in range(idx - 1, max(-1, idx - 8), -1):
-                candidate = lines[j]
-
-                if is_noise_line(candidate):
-                    continue
-
-                if is_time_line(candidate):
-                    continue
-
-                if is_available_line(candidate):
-                    continue
-
-                title_line = candidate
-                break
-
-        if not time_line:
-            time_line = "Godzina nieznana"
-
-        if not title_line:
-            title_line = "Wydarzenie nieznane"
-
-        event_text = f"{time_line} | {title_line} | {availability}"
-        found.append(event_text)
-
-    unique = []
-    seen = set()
-
-    for item in found:
-        key = item.lower()
-
-        if key not in seen:
-            seen.add(key)
-            unique.append(item)
-
-    return unique
+    return clean_events
 
 
 def scan_ttsd():
@@ -282,13 +264,9 @@ def scan_ttsd():
 
         page.wait_for_timeout(3000)
 
-        text = normalize_text(page.locator("body").inner_text(timeout=20000))
+        print("Wyciągam wydarzenia z DOM...", flush=True)
 
-        print("========== TEKST PO KLIKNIĘCIU ==========", flush=True)
-        print(text[:5000], flush=True)
-        print("========== KONIEC TEKSTU PO KLIKNIĘCIU ==========", flush=True)
-
-        events = parse_events_from_text(text)
+        events = extract_events_from_dom(page)
 
         if events:
             for event in events:
